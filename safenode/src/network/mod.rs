@@ -26,6 +26,7 @@ use futures::StreamExt;
 use libp2p::{
     core::muxing::StreamMuxerBox,
     identity,
+    identity::Keypair,
     kad::{record::store::MemoryStore, KBucketKey, Kademlia, KademliaConfig, QueryId},
     mdns,
     multiaddr::Protocol,
@@ -128,10 +129,8 @@ impl SwarmDriver {
         cfg: KademliaConfig,
         request_response: request_response::Behaviour<MsgCodec>,
     ) -> Result<(Network, mpsc::Receiver<NetworkEvent>, SwarmDriver)> {
-        // Create a random key for ourself.
-        let keypair = identity::Keypair::generate_ed25519();
+        let keypair = Self::get_keypair()?;
         let peer_id = PeerId::from(keypair.public());
-
         info!("Peer id: {:?}", peer_id);
 
         // QUIC configuration
@@ -181,6 +180,25 @@ impl SwarmDriver {
             network_event_receiver,
             swarm_driver,
         ))
+    }
+
+    /// Either read the keypair from a file with a hex-encoded secret key or create one at random.
+    fn get_keypair() -> Result<Keypair> {
+        let private_key_path = dirs_next::config_dir()
+            .ok_or_else(|| {
+                Error::NodeConfigurationError("Could not obtain config directory".to_string())
+            })?
+            .join(".safe")
+            .join("node")
+            .join("peer_secret_key");
+        let keypair = if private_key_path.is_file() {
+            let sk_hex_encoded = std::fs::read_to_string(private_key_path)?;
+            let sk_bytes = hex::decode(sk_hex_encoded)?;
+            identity::Keypair::ed25519_from_bytes(sk_bytes)?
+        } else {
+            identity::Keypair::generate_ed25519()
+        };
+        Ok(keypair)
     }
 
     /// Asynchronously drives the swarm event loop, handling events from both

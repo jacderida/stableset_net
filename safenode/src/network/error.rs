@@ -10,6 +10,7 @@ use crate::protocol::messages::Response;
 
 use super::{cmd::SwarmCmd, NetworkEvent};
 
+use libp2p::identity::DecodingError;
 use libp2p::{
     kad,
     request_response::{OutboundFailure, RequestId},
@@ -44,6 +45,9 @@ pub enum Error {
     #[error("Dial Error")]
     DialError(#[from] DialError),
 
+    #[error("Decoding Error")]
+    DecodingError(#[from] DecodingError),
+
     #[error("Outbound Error")]
     OutboundError(#[from] OutboundFailure),
 
@@ -62,6 +66,12 @@ pub enum Error {
     #[error("The oneshot::sender has been dropped")]
     SenderDropped(#[from] oneshot::error::RecvError),
 
+    #[error("Hex Error")]
+    HexError(#[from] hex::FromHexError),
+
     #[error("Could not get CLOSE_GROUP_SIZE number of peers.")]
     NotEnoughPeers,
+
+    #[error("Failed to configure node: {0}")]
+    NodeConfigurationError(String),
 }
