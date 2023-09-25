@@ -23,6 +23,9 @@ pub enum Error {
     /// A general error when a transfer fails
     #[error("Failed to send tokens due to {0}")]
     CouldNotSendMoney(String),
+    /// A general error when a retrieving a store cost fails
+    #[error("Failed to get store cost due to {0}")]
+    CouldNotGetStoreCost(String),
     /// A general error when receiving a transfer fails
     #[error("Failed to receive transfer due to {0}")]
     CouldNotReceiveMoney(String),

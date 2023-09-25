@@ -6,6 +6,7 @@
 // KIND, either express or implied. Please review the Licences for the specific language governing
 // permissions and limitations relating to use of the SAFE Network Software.
 
+use crate::UiManager;
 use clap::Parser;
 use color_eyre::{eyre::eyre, Result};
 use sn_client::{Client, Files, WalletClient};
@@ -14,6 +15,7 @@ use sn_transfers::{NanoTokens, Transfer};
 use std::{
     io::Read,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 use url::Url;
 use xor_name::XorName;
@@ -126,6 +128,7 @@ pub(crate) async fn wallet_cmds_without_client(cmds: &WalletCmds, root_dir: &Pat
 
 pub(crate) async fn wallet_cmds(
     cmds: WalletCmds,
+    ui_manager: Arc<UiManager>,
     client: &Client,
     root_dir: &Path,
     verify_store: bool,
@@ -138,7 +141,7 @@ pub(crate) async fn wallet_cmds(
             path,
             batch_size: _,
         } => {
-            let chunked_files = chunk_path(client, root_dir, &path).await?;
+            let chunked_files = chunk_path(ui_manager, client, root_dir, &path).await?;
 
             let all_chunks: Vec<_> = chunked_files
                 .values()

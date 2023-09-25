@@ -50,6 +50,8 @@ pub enum ClientEvent {
         /// The raw bytes of the received message
         msg: Vec<u8>,
     },
+    /// Occurs when there's a failure attempting to obtain a storage cost for content
+    ObtainStoreCostFailed(String),
 }
 
 /// Receiver Channel where users of the public API can listen to events broadcasted by the client.

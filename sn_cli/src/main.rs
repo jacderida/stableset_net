@@ -11,6 +11,7 @@ extern crate tracing;
 
 mod cli;
 mod subcommands;
+mod ui;
 
 use crate::{
     cli::Opt,
@@ -21,6 +22,7 @@ use crate::{
         wallet::{wallet_cmds, wallet_cmds_without_client, WalletCmds},
         SubCmd,
     },
+    ui::UiManager,
 };
 use bls::SecretKey;
 use clap::Parser;
@@ -31,6 +33,7 @@ use sn_logging::{init_logging, metrics::init_metrics, LogFormat};
 use sn_peers_acquisition::parse_peers_args;
 use sn_transfers::bls_secret_from_hex;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tracing::Level;
 
 const CLIENT_KEY: &str = "clientkey";
@@ -94,16 +97,28 @@ async fn main() -> Result<()> {
 
     let client = Client::new(secret_key, bootstrap_peers, opt.timeout, opt.concurrency).await?;
 
+    let ui_manager = Arc::new(UiManager::new(client.clone())?);
+    let ui_manager_clone = ui_manager.clone();
+    let ui_task = tokio::task::spawn(async move { ui_manager_clone.run().await });
+
     // default to verifying storage
     let should_verify_store = !opt.no_verify;
 
     match opt.cmd {
         SubCmd::Wallet(cmds) => {
-            wallet_cmds(cmds, &client, &client_data_dir_path, should_verify_store).await?
+            wallet_cmds(
+                cmds,
+                ui_manager,
+                &client,
+                &client_data_dir_path,
+                should_verify_store,
+            )
+            .await?
         }
         SubCmd::Files(cmds) => {
             files_cmds(
                 cmds,
+                ui_manager,
                 client.clone(),
                 &client_data_dir_path,
                 should_verify_store,
@@ -115,6 +130,8 @@ async fn main() -> Result<()> {
         }
         SubCmd::Gossipsub(cmds) => gossipsub_cmds(cmds, &client).await?,
     };
+
+    let _ = ui_task.await;
 
     Ok(())
 }

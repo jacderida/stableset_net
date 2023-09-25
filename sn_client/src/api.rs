@@ -143,6 +143,7 @@ impl Client {
                     info!("Client connected to the Network {is_connected:?}.");
                     break;
                 }
+                Ok(ClientEvent::GossipsubMsg { .. }) => {}
                 Ok(ClientEvent::InactiveClient(timeout)) => {
                     if is_connected {
                         info!("The client was inactive for {timeout:?}.");
@@ -152,7 +153,9 @@ impl Client {
 
                     continue;
                 }
-                Ok(ClientEvent::GossipsubMsg { .. }) => {}
+                Ok(ClientEvent::ObtainStoreCostFailed(msg)) => {
+                    warn!("Failed to obtain store cost: {msg}");
+                }
                 Err(err) => {
                     error!("Unexpected error during client startup {err:?}");
                     println!("Unexpected error during client startup {err:?}");

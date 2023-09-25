@@ -7,6 +7,7 @@
 // permissions and limitations relating to use of the SAFE Network Software.
 
 use super::wallet::{ChunkedFile, BATCH_SIZE};
+use crate::ui::UiManager;
 use bytes::Bytes;
 use clap::Parser;
 use color_eyre::{
@@ -22,6 +23,7 @@ use std::{
     io::prelude::*,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::task::JoinHandle;
@@ -61,13 +63,14 @@ pub enum FilesCmds {
 
 pub(crate) async fn files_cmds(
     cmds: FilesCmds,
+    ui_manager: Arc<UiManager>,
     client: Client,
     root_dir: &Path,
     verify_store: bool,
 ) -> Result<()> {
     match cmds {
         FilesCmds::Upload { path, batch_size } => {
-            upload_files(path, client, root_dir, verify_store, batch_size).await?
+            upload_files(path, ui_manager, client, root_dir, verify_store, batch_size).await?
         }
         FilesCmds::Download {
             file_name,
@@ -112,6 +115,7 @@ pub(crate) async fn files_cmds(
 }
 
 pub(super) async fn chunk_path(
+    ui_manager: Arc<UiManager>,
     client: &Client,
     root_dir: &Path,
     files_path: &Path,
@@ -120,7 +124,13 @@ pub(super) async fn chunk_path(
 
     let file_api: Files = Files::new(client.clone(), root_dir.to_path_buf());
 
-    // Get the list of Chunks addresses from the files found at 'files_path'
+    let total_files = WalkDir::new(files_path)
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry.file_type().is_file())
+        .count();
+    ui_manager.init_new_safe_task("Chunking files...", total_files as u64);
+
     let chunks_dir = std::env::temp_dir();
     let mut num_of_chunks = 0;
     let mut chunked_files = BTreeMap::new();
@@ -151,14 +161,13 @@ pub(super) async fn chunk_path(
             num_of_chunks += chunks.len();
 
             chunked_files.insert(file_addr, ChunkedFile { file_name, chunks });
+            ui_manager.inc_safe_task(1);
         }
     }
 
     if chunked_files.is_empty() {
         bail!("The provided path does not contain any file. Please check your path!\nExiting...");
     }
-
-    println!("Total number of chunks to be stored: {}", num_of_chunks);
 
     Ok(chunked_files)
 }
@@ -167,6 +176,7 @@ pub(super) async fn chunk_path(
 /// verify if the data was stored successfully.
 async fn upload_files(
     files_path: PathBuf,
+    ui_manager: Arc<UiManager>,
     client: Client,
     root_dir: &Path,
     verify_store: bool,
@@ -179,7 +189,7 @@ async fn upload_files(
     );
 
     // Payment shall always be verified.
-    let chunks_to_upload = chunk_path(&client, root_dir, &files_path).await?;
+    let chunks_to_upload = chunk_path(ui_manager.clone(), &client, root_dir, &files_path).await?;
 
     let uploaded_file_info = chunks_to_upload
         .iter()
@@ -191,29 +201,32 @@ async fn upload_files(
         .flat_map(|(_, chunk)| chunk.chunks)
         .collect::<Vec<_>>();
 
-    let total_chunks_uploading = chunks_to_upload.len();
+    let total_chunks_to_upload = chunks_to_upload.len();
+    ui_manager.init_new_safe_task("Uploading chunks...", total_chunks_to_upload as u64);
 
-    let mut progress = 0;
-    // Clone necessary variables for each file upload
     let file_api: Files = Files::new(client.clone(), root_dir.to_path_buf());
 
     for chunks_batch in chunks_to_upload.chunks(batch_size) {
-        let now = Instant::now();
-        progress += chunks_batch.len();
-
         // pay for and verify payment... if we don't verify here, chunks uploads will surely fail
         println!(
             "Getting upload costs from network for {} chunks...",
             chunks_batch.len()
         );
-        file_api
+        let (cost, new_balance) = file_api
             .pay_for_chunks(chunks_batch.iter().map(|(name, _)| *name).collect(), true)
             .await?;
+        ui_manager.set_safe_text(&format!(
+            "Paid {} for {} chunks. New balance: {}",
+            cost,
+            chunks_batch.len(),
+            new_balance
+        ));
 
         // Verification will be carried out later on, if being asked to.
         // Hence no need to carry out verification within the first attempt.
         // Just to check there were no odd errors during upload.
         for result in join_all(upload_chunks_in_parallel(
+            ui_manager.clone(),
             file_api.clone(),
             chunks_batch.to_vec(),
             false,
@@ -222,16 +235,6 @@ async fn upload_files(
         {
             let _ = result?;
         }
-
-        let elapsed = now.elapsed();
-        println!(
-            "Uploaded {:?} chunks in {elapsed:?}. Current progress is {progress}/{total_chunks_uploading}.",
-            chunks_batch.len(),
-        );
-        info!(
-            "Uploaded {:?} chunks in {elapsed:?}. Current progress is {progress}/{total_chunks_uploading}.",
-            chunks_batch.len(),
-        );
     }
 
     println!("First round of upload complete. Verifying and repaying if required...");
@@ -247,11 +250,17 @@ async fn upload_files(
                 "Verifying and potentially topping up payment of {:?} chunks",
                 data_to_verify_or_repay.len()
             );
-            data_to_verify_or_repay =
-                verify_and_repay_if_needed(file_api.clone(), data_to_verify_or_repay, batch_size)
-                    .await?;
+            data_to_verify_or_repay = verify_and_repay_if_needed(
+                ui_manager.clone(),
+                file_api.clone(),
+                data_to_verify_or_repay,
+                batch_size,
+            )
+            .await?;
         }
     }
+
+    ui_manager.clear()?;
 
     println!(
         "Uploaded all chunks in {}",
@@ -279,6 +288,7 @@ async fn upload_files(
 /// This spawns a task for each chunk to be uploaded, returns those handles.
 ///
 fn upload_chunks_in_parallel(
+    ui_manager: Arc<UiManager>,
     file_api: Files,
     chunks_paths: Vec<(XorName, PathBuf)>,
     verify_store: bool,
@@ -288,7 +298,12 @@ fn upload_chunks_in_parallel(
         let file_api = file_api.clone();
 
         // Spawn a task for each chunk to be uploaded
-        let handle = tokio::spawn(upload_chunk(file_api, (name, path), verify_store));
+        let handle = tokio::spawn(upload_chunk(
+            ui_manager.clone(),
+            file_api,
+            (name, path),
+            verify_store,
+        ));
         upload_handles.push(handle);
     }
 
@@ -299,6 +314,7 @@ fn upload_chunks_in_parallel(
 /// Store chunks from chunk_paths (assuming payments have already been made and are in our local wallet).
 /// If verify_store is true, we will attempt to fetch the chunks from the network to verify it is stored.
 async fn upload_chunk(
+    ui_manager: Arc<UiManager>,
     file_api: Files,
     chunk: (XorName, PathBuf),
     verify_store: bool,
@@ -312,10 +328,11 @@ async fn upload_chunk(
         .get_local_payment_and_upload_chunk(chunk, verify_store)
         .await?;
 
-    println!(
+    ui_manager.inc_safe_task(1);
+    ui_manager.set_safe_text(&format!(
         "Uploaded chunk #{name} in {}",
         format_elapsed_time(upload_start_time.elapsed())
-    );
+    ));
 
     Ok(())
 }
@@ -324,17 +341,18 @@ async fn upload_chunk(
 /// Repay if they don't.
 /// Return a list of files which had to be repaid, but are not yet reverified.
 async fn verify_and_repay_if_needed(
+    ui_manager: Arc<UiManager>,
     file_api: Files,
     chunks_paths: Vec<(XorName, PathBuf)>,
     batch_size: usize,
 ) -> Result<Vec<(XorName, PathBuf)>> {
-    let total_chunks = chunks_paths.len();
+    // let total_chunks = chunks_paths.len();
 
-    println!(
-        "======= Verification: {total_chunks} chunks to be checked and repaid if required ============="
-    );
+    // println!(
+    //     "======= Verification: {total_chunks} chunks to be checked and repaid if required ============="
+    // );
 
-    let now = Instant::now();
+    // let now = Instant::now();
     let mut failed_chunks = Vec::new();
     for chunks_batch in chunks_paths.chunks(batch_size) {
         // now we try and get batched chunks, keep track of any that fail
@@ -360,16 +378,16 @@ async fn verify_and_repay_if_needed(
         // Check for any errors during fetch
         for result in verify_results {
             if let ((chunk_addr, path), true) = result?? {
-                println!("Failed to fetch a chunk {chunk_addr:?}");
+                // println!("Failed to fetch a chunk {chunk_addr:?}");
                 // This needs to be NetAddr to allow for repayment
                 failed_chunks.push((chunk_addr, path));
             }
         }
     }
 
-    let elapsed = now.elapsed();
-    println!("After {elapsed:?}, verified {total_chunks:?} chunks");
-    let now = Instant::now();
+    // let elapsed = now.elapsed();
+    // println!("After {elapsed:?}, verified {total_chunks:?} chunks");
+    // let now = Instant::now();
 
     let total_failed_chunks = failed_chunks
         .iter()
@@ -377,19 +395,19 @@ async fn verify_and_repay_if_needed(
         .collect::<Vec<_>>();
 
     if total_failed_chunks.is_empty() {
-        println!("======= Verification complete: all chunks paid and stored =============");
+        // println!("======= Verification complete: all chunks paid and stored =============");
         return Ok(total_failed_chunks);
     }
 
-    let num_of_failed_chunks = failed_chunks.len();
-    println!("======= Verification: {num_of_failed_chunks} chunks were not stored. Repaying them in batches. =============");
+    // let num_of_failed_chunks = failed_chunks.len();
+    // println!("======= Verification: {num_of_failed_chunks} chunks were not stored. Repaying them in batches. =============");
 
     // If there were any failed chunks, we need to repay them
     for failed_chunks_batch in failed_chunks.chunks(batch_size) {
-        println!(
-            "Failed to fetch {} chunks. Attempting to repay them.",
-            failed_chunks_batch.len()
-        );
+        // println!(
+        //     "Failed to fetch {} chunks. Attempting to repay them.",
+        //     failed_chunks_batch.len()
+        // );
 
         let mut wallet = file_api.wallet()?;
 
@@ -407,6 +425,7 @@ async fn verify_and_repay_if_needed(
         // outcome here is not important as we'll verify this later
         let upload_file_api = file_api.clone();
         let ongoing_uploads = upload_chunks_in_parallel(
+            ui_manager.clone(),
             upload_file_api,
             failed_chunks_batch
                 .iter()
@@ -427,8 +446,8 @@ async fn verify_and_repay_if_needed(
         }
     }
 
-    let elapsed = now.elapsed();
-    println!("Repaid and re-uploaded {num_of_failed_chunks:?} chunks in {elapsed:?}");
+    // let elapsed = now.elapsed();
+    // println!("Repaid and re-uploaded {num_of_failed_chunks:?} chunks in {elapsed:?}");
 
     Ok(total_failed_chunks)
 }

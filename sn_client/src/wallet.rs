@@ -10,7 +10,7 @@ use futures::TryFutureExt;
 use sn_transfers::{SignedSpend, Transfer};
 use xor_name::XorName;
 
-use super::Client;
+use super::{Client, ClientEvent};
 
 use sn_protocol::NetworkAddress;
 use sn_transfers::{CashNote, MainPubkey, NanoTokens};
@@ -156,17 +156,29 @@ impl WalletClient {
                         let _ = payment_map.insert(xorname, cost);
                         debug!("Storecosts inserted into payment map for {content_addr:?}");
                     } else {
-                        warn!("Cannot get store cost for a content that is not a data type: {content_addr:?}");
-                        println!("Cannot get store cost for a content that is not a data type: {content_addr:?}");
+                        self.client
+                            .events_channel
+                            .broadcast(ClientEvent::ObtainStoreCostFailed(format!(
+                                "Content at {} is not a data type",
+                                content_addr.to_string()
+                            )))
+                            .map_err(|e| WalletError::CouldNotGetStoreCost(e.to_string()))?;
                     }
                 }
                 Ok((content_addr, Err(err))) => {
-                    warn!("Cannot get store cost for {content_addr:?} with error {err:?}");
-                    println!("Cannot get store cost for {content_addr:?} with error {err:?}");
+                    self.client
+                        .events_channel
+                        .broadcast(ClientEvent::ObtainStoreCostFailed(format!(
+                            "Obtaining store cost failed for content at {}: {err:?}",
+                            content_addr.to_string()
+                        )))
+                        .map_err(|e| WalletError::CouldNotGetStoreCost(e.to_string()))?;
                 }
                 Err(e) => {
-                    warn!("Cannot get a store cost for a content with error {e:?}");
-                    println!("Cannot get a store cost for a content with error {e:?}");
+                    self.client
+                        .events_channel
+                        .broadcast(ClientEvent::ObtainStoreCostFailed(format!("{e:?}")))
+                        .map_err(|e| WalletError::CouldNotGetStoreCost(e.to_string()))?;
                 }
             }
         }
@@ -194,8 +206,7 @@ impl WalletClient {
         all_data_payments: BTreeMap<XorName, Vec<(MainPubkey, NanoTokens)>>,
         verify_store: bool,
     ) -> WalletResult<NanoTokens> {
-        // TODO:
-        // Check for any existing payment CashNotes, and use them if they exist, only topping up if needs be
+        // TODO: Check for any existing payment CashNotes, and use them if they exist, only topping up if needs be
         let num_of_payments = all_data_payments.len();
 
         let now = Instant::now();
@@ -229,8 +240,8 @@ impl WalletClient {
         }
 
         let elapsed = now.elapsed();
-        println!("All transfers completed in {elapsed:?}");
-        println!("Total payment: {total_cost:?} nano tokens for {num_of_payments:?} chunks");
+        info!("All transfers completed in {elapsed:?}");
+        info!("Total payment: {total_cost:?} nano tokens for {num_of_payments:?} chunks");
 
         Ok(total_cost)
     }
