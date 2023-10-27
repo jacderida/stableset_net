@@ -10,30 +10,18 @@
 extern crate tracing;
 
 mod rpc;
+mod run;
 
 use clap::Parser;
-use eyre::{eyre, Error, Result};
-use libp2p::{identity::Keypair, PeerId};
-#[cfg(feature = "metrics")]
-use sn_logging::metrics::init_metrics;
-use sn_logging::{LogFormat, LogOutputDest};
-use sn_node::{Marker, NodeBuilder, NodeEvent, NodeEventsReceiver};
-use sn_peers_acquisition::{parse_peers_args, PeersArgs};
+use eyre::Result;
+use sn_logging::LogFormat;
+use sn_peers_acquisition::PeersArgs;
 use std::{
     env,
-    io::Write,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    path::{Path, PathBuf},
-    process::Command,
-    time::Duration,
+    path::PathBuf,
 };
-use tokio::{
-    runtime::Runtime,
-    sync::{broadcast::error::RecvError, mpsc},
-    time::sleep,
-};
-use tracing_appender::non_blocking::WorkerGuard;
-use tracing_core::Level;
+use tokio::signal::ctrl_c;
 
 #[derive(Debug, Clone)]
 pub enum LogOutputDestArg {
@@ -66,7 +54,7 @@ pub fn parse_log_output(val: &str) -> Result<LogOutputDestArg> {
 // They are used for inserting line breaks when the help menu is rendered in the UI.
 #[derive(Parser, Debug)]
 #[clap(name = "safenode cli", version = env!("CARGO_PKG_VERSION"))]
-struct Opt {
+pub struct Opt {
     /// Specify the logging output destination.
     ///
     /// Valid values are "stdout", "data-dir", or a custom path.
@@ -149,375 +137,155 @@ struct Opt {
     /// The special value `0` will cause the OS to assign a random port.
     #[clap(long, default_value_t = 0)]
     metrics_server_port: u16,
+
+    #[cfg(windows)]
+    /// Set to true to indicate the node should run as a service.
+    #[clap(long)]
+    run_as_service: bool,
 }
 
-#[derive(Debug)]
-// To be sent to the main thread in order to stop/restart the execution of the safenode app.
-enum NodeCtrl {
-    // Request to stop the exeution of the safenode app, providing an error as a reason for it.
-    Stop { delay: Duration, cause: Error },
-    // Request to restart the exeution of the safenode app,
-    // retrying to join the network, after the requested delay.
-    Restart(Duration),
-    // Request to update the safenode app, and restart it, after the requested delay.
-    Update(Duration),
-}
-
+#[cfg(unix)]
 fn main() -> Result<()> {
     color_eyre::install()?;
     let opt = Opt::parse();
+    crate::run::run(opt)
+}
 
-    let node_socket_addr = SocketAddr::new(opt.ip, opt.port);
-    let (root_dir, keypair) = get_root_dir_and_keypair(&opt.root_dir)?;
+#[cfg(windows)]
+fn main() -> Result<()> {
+    let opt = Opt::parse();
+    if opt.run_as_service {
+        windows_service::main()?;
+    } else {
+        color_eyre::install()?;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel(1);
 
-    let (log_output_dest, _log_appender_guard) = init_logging(&opt, keypair.public().to_peer_id())?;
+            let shutdown_tx_clone = shutdown_tx.clone();
+            let ctrl_c_handle = tokio::spawn(async move {
+                ctrl_c().await.unwrap();
+                let _ = shutdown_tx_clone.send(());
+            });
 
-    let rt = Runtime::new()?;
-    // bootstrap peers can be empty for the genesis node.
-    let bootstrap_peers = rt.block_on(parse_peers_args(opt.peers)).unwrap_or(vec![]);
-    let msg = format!(
-        "Running {} v{}",
-        env!("CARGO_BIN_NAME"),
-        env!("CARGO_PKG_VERSION")
-    );
-    info!("\n{}\n{}", msg, "=".repeat(msg.len()));
-    debug!("Built with git version: {}", sn_build_info::git_info());
+            if let Err(e) = crate::run::run(opt, shutdown_tx).await {
+                error!("Node error: {}", e);
+            }
 
-    info!("Node started with initial_peers {bootstrap_peers:?}");
-
-    // Create a tokio runtime per `run_node` attempt, this ensures
-    // any spawned tasks are closed before we would attempt to run
-    // another process with these args.
-    #[cfg(feature = "metrics")]
-    rt.spawn(init_metrics(std::process::id()));
-    rt.block_on(async move {
-        let node_builder = NodeBuilder::new(
-            keypair,
-            node_socket_addr,
-            bootstrap_peers,
-            opt.local,
-            root_dir,
-        );
-        #[cfg(feature = "open-metrics")]
-        let mut node_builder = node_builder;
-        #[cfg(feature = "open-metrics")]
-        node_builder.metrics_server_port(opt.metrics_server_port);
-        run_node(node_builder, opt.rpc, &log_output_dest).await?;
-
-        Ok::<(), eyre::Report>(())
-    })?;
-
-    // actively shut down the runtime
-    rt.shutdown_timeout(Duration::from_secs(2));
-
-    // we got this far without error, which means (so far) the only thing we should be doing
-    // is restarting the node
-    start_new_node_process();
-
-    // Command was successful, so we shut down the process
-    println!("A new node process has been started successfully.");
+            tokio::select! {
+                _ = ctrl_c_handle => {
+                    // Ctrl+C handle finished execution
+                },
+                _ = shutdown_rx.recv() => {
+                    // Got shutdown signal
+                }
+            }
+        });
+    }
     Ok(())
 }
 
-/// Start a node with the given configuration.
-async fn run_node(
-    node_builder: NodeBuilder,
-    rpc: Option<SocketAddr>,
-    log_output_dest: &str,
-) -> Result<()> {
-    let started_instant = std::time::Instant::now();
-
-    info!("Starting node ...");
-    let running_node = node_builder.build_and_run()?;
-
-    println!(
-        "
-Node started
-
-PeerId is {}
-You can check your reward balance by running:
-`safe wallet balance --peer-id={}`
-    ",
-        running_node.peer_id(),
-        running_node.peer_id()
-    );
-
-    // write the PID to the root dir
-    let pid = std::process::id();
-    let pid_file = running_node.root_dir_path().join("safenode.pid");
-    std::fs::write(pid_file, pid.to_string().as_bytes())?;
-
-    // Channel to receive node ctrl cmds from RPC service (if enabled), and events monitoring task
-    let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<NodeCtrl>(5);
-
-    // Monitor `NodeEvents`
-    let node_events_rx = running_node.node_events_channel().subscribe();
-    monitor_node_events(node_events_rx, ctrl_tx.clone());
-
-    // Start up gRPC interface if enabled by user
-    if let Some(addr) = rpc {
-        rpc::start_rpc_service(
-            addr,
-            log_output_dest,
-            running_node.clone(),
-            ctrl_tx,
-            started_instant,
-        );
-    }
-
-    // Keep the node and gRPC service (if enabled) running.
-    // We'll monitor any NodeCtrl cmd to restart/stop/update,
-    loop {
-        match ctrl_rx.recv().await {
-            Some(NodeCtrl::Restart(delay)) => {
-                let msg = format!("Node is restarting in {delay:?}...");
-                info!("{msg}");
-                println!("{msg} Node path: {log_output_dest}");
-                sleep(delay).await;
-
-                break Ok(());
-            }
-            Some(NodeCtrl::Stop { delay, cause }) => {
-                let msg = format!("Node is stopping in {delay:?}...");
-                info!("{msg}");
-                println!("{msg} Node log path: {log_output_dest}");
-                sleep(delay).await;
-                return Err(cause);
-            }
-            Some(NodeCtrl::Update(_delay)) => {
-                // TODO: implement self-update once safenode app releases are published again
-                println!("No self-update supported yet.");
-            }
-            None => {
-                info!("Internal node ctrl cmds channel has been closed, restarting node");
-                break Err(eyre!("Internal node ctrl cmds channel has been closed"));
-            }
-        }
-    }
-}
-
-fn monitor_node_events(mut node_events_rx: NodeEventsReceiver, ctrl_tx: mpsc::Sender<NodeCtrl>) {
-    let _handle = tokio::spawn(async move {
-        loop {
-            match node_events_rx.recv().await {
-                Ok(NodeEvent::ConnectedToNetwork) => Marker::NodeConnectedToNetwork.log(),
-                Ok(NodeEvent::ChannelClosed) | Err(RecvError::Closed) => {
-                    if let Err(err) = ctrl_tx
-                        .send(NodeCtrl::Stop {
-                            delay: Duration::from_secs(1),
-                            cause: eyre!("Node events channel closed!"),
-                        })
-                        .await
-                    {
-                        error!(
-                            "Failed to send node control msg to safenode bin main thread: {err}"
-                        );
-                        break;
-                    }
-                }
-                Ok(NodeEvent::BehindNat) => {
-                    if let Err(err) = ctrl_tx
-                        .send(NodeCtrl::Stop {
-                            delay: Duration::from_secs(1),
-                            cause: eyre!("We have been determined to be behind a NAT. This means we are not reachable externally by other nodes. In the future, the network will implement relays that allow us to still join the network."),
-                        })
-                        .await
-                    {
-                        error!(
-                            "Failed to send node control msg to safenode bin main thread: {err}"
-                        );
-                        break;
-                    }
-                }
-                Ok(event) => {
-                    /* we ignore other events */
-                    info!("Currently ignored node event {event:?}");
-                }
-                Err(RecvError::Lagged(n)) => {
-                    warn!("Skipped {n} node events!");
-                    continue;
-                }
-            }
-        }
-    });
-}
-
-fn init_logging(opt: &Opt, peer_id: PeerId) -> Result<(String, Option<WorkerGuard>)> {
-    let logging_targets = vec![
-        // TODO: Reset to nice and clean defaults once we have a better idea of what we want
-        ("sn_networking".to_string(), Level::DEBUG),
-        ("safenode".to_string(), Level::TRACE),
-        ("sn_build_info".to_string(), Level::TRACE),
-        ("sn_logging".to_string(), Level::TRACE),
-        ("sn_node".to_string(), Level::TRACE),
-        ("sn_peers_acquisition".to_string(), Level::TRACE),
-        ("sn_protocol".to_string(), Level::TRACE),
-        ("sn_registers".to_string(), Level::TRACE),
-        ("sn_testnet".to_string(), Level::TRACE),
-        ("sn_transfers".to_string(), Level::TRACE),
-    ];
-
-    let output_dest = match &opt.log_output_dest {
-        LogOutputDestArg::Stdout => LogOutputDest::Stdout,
-        LogOutputDestArg::DataDir => {
-            let path = get_root_dir(peer_id)?.join("logs");
-            LogOutputDest::Path(path)
-        }
-        LogOutputDestArg::Path(path) => LogOutputDest::Path(path.clone()),
+#[cfg(windows)]
+mod windows_service {
+    use super::Opt;
+    use clap::Parser;
+    use std::ffi::OsString;
+    use tokio::sync::mpsc;
+    use tokio::time::Duration;
+    use tracing::error;
+    use windows_service::{
+        define_windows_service,
+        service::{
+            ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
+            ServiceType,
+        },
+        service_control_handler::{self, ServiceControlHandlerResult},
+        service_dispatcher, Result,
     };
 
-    #[cfg(not(feature = "otlp"))]
-    let log_appender_guard = {
-        let mut log_builder = sn_logging::LogBuilder::new(logging_targets);
-        log_builder.output_dest(output_dest.clone());
-        log_builder.format(opt.log_format.clone().unwrap_or(LogFormat::Default));
-        if let Some(files) = opt.max_uncompressed_log_files {
-            log_builder.max_uncompressed_log_files(files);
-        }
-        if let Some(files) = opt.max_compressed_log_files {
-            log_builder.max_compressed_log_files(files);
-        }
+    const SERVICE_NAME: &str = "safenode4";
+    const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
 
-        log_builder.initialize()?
-    };
+    define_windows_service!(ffi_service_main, node_service_main);
 
-    #[cfg(feature = "otlp")]
-    let (_rt, log_appender_guard) = {
-        // init logging in a separate runtime if we are sending traces to an opentelemetry server
-        let rt = Runtime::new()?;
-        let guard = rt.block_on(async {
-            let mut log_builder = sn_logging::LogBuilder::new(logging_targets);
-            log_builder.output_dest(output_dest.clone());
-            log_builder.format(opt.log_format.clone().unwrap_or(LogFormat::Default));
-            if let Some(files) = opt.max_uncompressed_log_files {
-                log_builder.max_uncompressed_log_files(files);
+    fn node_service_main(args: Vec<OsString>) {
+        let opt = Opt::parse_from(args.iter());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            if let Err(e) = run_service(opt).await {
+                error!("Service encountered error: {}", e);
             }
-            if let Some(files) = opt.max_compressed_log_files {
-                log_builder.max_compressed_log_files(files);
+        });
+    }
+
+    pub fn main() -> std::io::Result<()> {
+        service_dispatcher::start(SERVICE_NAME, ffi_service_main)
+            .map_err(|x| std::io::Error::new(std::io::ErrorKind::Other, x))
+    }
+
+    async fn run_service(opt: Opt) -> Result<()> {
+        // Create a channel to be able to poll a stop event from the service worker loop.
+        let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
+
+        let event_handler = {
+            let shutdown_tx = shutdown_tx.clone();
+            move |control_event| -> ServiceControlHandlerResult {
+                match control_event {
+                    ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+                    ServiceControl::Stop => match shutdown_tx.try_send(()) {
+                        Ok(_) => ServiceControlHandlerResult::NoError,
+                        Err(err) => {
+                            error!("Failed to send shutdown signal: {}", err);
+                            ServiceControlHandlerResult::Other(1)
+                        }
+                    },
+                    _ => ServiceControlHandlerResult::NotImplemented,
+                }
             }
-            log_builder.initialize()
+        };
+
+        let status_handle = service_control_handler::register(SERVICE_NAME, event_handler)?;
+        status_handle.set_service_status(ServiceStatus {
+            service_type: SERVICE_TYPE,
+            current_state: ServiceState::Running,
+            controls_accepted: ServiceControlAccept::STOP,
+            exit_code: ServiceExitCode::Win32(0),
+            checkpoint: 0,
+            wait_hint: Duration::default(),
+            process_id: None,
         })?;
-        (rt, guard)
-    };
-    Ok((output_dest.to_string(), log_appender_guard))
-}
 
-fn create_secret_key_file(path: impl AsRef<Path>) -> Result<std::fs::File, std::io::Error> {
-    let mut opt = std::fs::OpenOptions::new();
-    opt.write(true).create_new(true);
+        let shutdown_tx_clone = shutdown_tx.clone();
+        let mut handle = Some(tokio::spawn(async move {
+            if let Err(x) = crate::run::run(opt, shutdown_tx_clone).await {
+                error!("Error: {x}");
+            }
+        }));
 
-    // On Unix systems, make sure only the current user can read/write.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opt.mode(0o600);
+        loop {
+            tokio::select! {
+                _ = handle.take().unwrap() => {
+                    debug!("Main run_node thread finished executing");
+                    break;
+                },
+                _ = shutdown_rx.recv() => {
+                    debug!("Received shutdown signal");
+                    break;
+                },
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {},
+            }
+        }
+
+        status_handle.set_service_status(ServiceStatus {
+            service_type: SERVICE_TYPE,
+            current_state: ServiceState::Stopped,
+            controls_accepted: ServiceControlAccept::empty(),
+            exit_code: ServiceExitCode::Win32(0),
+            checkpoint: 0,
+            wait_hint: Duration::default(),
+            process_id: None,
+        })?;
+
+        Ok(())
     }
-
-    opt.open(path)
-}
-
-fn keypair_from_path(path: impl AsRef<Path>) -> Result<Keypair> {
-    let keypair = match std::fs::read(&path) {
-        // If the file is opened successfully, read the key from it
-        Ok(key) => {
-            let keypair = Keypair::ed25519_from_bytes(key)
-                .map_err(|err| eyre!("could not read ed25519 key from file: {err}"))?;
-
-            info!("loaded secret key from file: {:?}", path.as_ref());
-
-            keypair
-        }
-        // In case the file is not found, generate a new keypair and write it to the file
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            let secret_key = libp2p::identity::ed25519::SecretKey::generate();
-            let mut file = create_secret_key_file(&path)
-                .map_err(|err| eyre!("could not create secret key file: {err}"))?;
-            file.write_all(secret_key.as_ref())?;
-
-            info!("generated new key and stored to file: {:?}", path.as_ref());
-
-            libp2p::identity::ed25519::Keypair::from(secret_key).into()
-        }
-        // Else the file can't be opened, for whatever reason (e.g. permissions).
-        Err(err) => {
-            return Err(eyre!("failed to read secret key file: {err}"));
-        }
-    };
-
-    Ok(keypair)
-}
-
-fn get_root_dir(peer_id: PeerId) -> Result<PathBuf> {
-    let dir = dirs_next::data_dir()
-        .ok_or_else(|| eyre!("could not obtain root directory path".to_string()))?
-        .join("safe")
-        .join("node")
-        .join(peer_id.to_string());
-
-    Ok(dir)
-}
-
-/// The keypair is located inside the root directory. At the same time, when no dir is specified,
-/// the dir name is derived from the keypair used in the application: the peer ID is used as the directory name.
-fn get_root_dir_and_keypair(root_dir: &Option<PathBuf>) -> Result<(PathBuf, Keypair)> {
-    match root_dir {
-        Some(dir) => {
-            std::fs::create_dir_all(dir)?;
-
-            let secret_key_path = dir.join("secret-key");
-            Ok((dir.clone(), keypair_from_path(secret_key_path)?))
-        }
-        None => {
-            let secret_key = libp2p::identity::ed25519::SecretKey::generate();
-            let keypair: Keypair =
-                libp2p::identity::ed25519::Keypair::from(secret_key.clone()).into();
-            let peer_id = keypair.public().to_peer_id();
-
-            let dir = get_root_dir(peer_id)?;
-            std::fs::create_dir_all(&dir)?;
-
-            let secret_key_path = dir.join("secret-key");
-
-            let mut file = create_secret_key_file(secret_key_path)
-                .map_err(|err| eyre!("could not create secret key file: {err}"))?;
-            file.write_all(secret_key.as_ref())?;
-
-            Ok((dir, keypair))
-        }
-    }
-}
-
-/// Starts a new process running the binary with the same args as
-/// the current process
-fn start_new_node_process() {
-    // Retrieve the current executable's path
-    let current_exe = env::current_exe().unwrap();
-
-    // Retrieve the command-line arguments passed to this process
-    let args: Vec<String> = env::args().collect();
-
-    info!("Original args are: {args:?}");
-
-    // Create a new Command instance to run the current executable
-    let mut cmd = Command::new(current_exe);
-
-    // Set the arguments for the new Command
-    cmd.args(&args[1..]); // Exclude the first argument (binary path)
-
-    warn!(
-        "Attempting to start a new process as node process loop has been broken: {:?}",
-        cmd
-    );
-    // Execute the command
-    let _handle = match cmd.spawn() {
-        Ok(status) => status,
-        Err(e) => {
-            // Do not return an error as this isn't a critical failure.
-            // The current node can continue.
-            eprintln!("Failed to execute hard-restart command: {}", e);
-            error!("Failed to execute hard-restart command: {}", e);
-
-            return;
-        }
-    };
 }

@@ -66,7 +66,7 @@ sn_protocol = { path = "../sn_protocol", version = "0.8.3" }
 sn_registers = { path = "../sn_registers", version = "0.3.2" }
 sn_transfers = { path = "../sn_transfers", version = "0.14.6" }
 thiserror = "1.0.23"
-tokio = { version = "1.32.0", features = ["io-util", "macros", "parking_lot", "rt", "sync", "time"] }
+tokio = { version = "1.32.0", features = ["io-util", "macros", "parking_lot", "rt", "signal", "sync", "time"] }
 tokio-stream = { version = "~0.1.12" }
 tracing = { version = "~0.1.26" }
 tracing-appender = "~0.2.0"
@@ -79,6 +79,9 @@ tracing-log = { version = "0.1.3" }
 strum = { version = "0.25.0", features = ["derive"] }
 tiny_http = { version="0.12", features = ["ssl-rustls"] }
 color-eyre = "0.6.2"
+
+[target.'cfg(any(target_os = "windows"))'.dependencies]
+windows-service = "0.6.0"
 
 [dev-dependencies]
 assert_fs = "1.0.0"

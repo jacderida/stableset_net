@@ -42,13 +42,4 @@ service SafeNode {
 
   // Publish a msg on a Gossipsub topic
   rpc PublishOnTopic (GossipsubPublishRequest) returns (GossipsubPublishResponse);
-
-  // Stop the execution of this node
-  rpc Stop (StopRequest) returns (StopResponse);
-
-  // Restart the node
-  rpc Restart (RestartRequest) returns (RestartResponse);
-
-  // Update the node
-  rpc Update (UpdateRequest) returns (UpdateResponse);
 }

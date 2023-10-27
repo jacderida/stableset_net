@@ -8,16 +8,9 @@
 
 use sn_node::RunningNode;
 
-use super::NodeCtrl;
-
-use eyre::{ErrReport, Result};
-use std::{
-    env,
-    net::SocketAddr,
-    process,
-    time::{Duration, Instant},
-};
-use tokio::sync::mpsc::{self, Sender};
+use eyre::Result;
+use std::{env, net::SocketAddr, process, time::Instant};
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{transport::Server, Code, Request, Response, Status};
 use tracing::{debug, info, trace};
@@ -27,8 +20,7 @@ use safenode_proto::{
     GossipsubPublishRequest, GossipsubPublishResponse, GossipsubSubscribeRequest,
     GossipsubSubscribeResponse, GossipsubUnsubscribeRequest, GossipsubUnsubscribeResponse,
     NetworkInfoRequest, NetworkInfoResponse, NodeEvent, NodeEventsRequest, NodeInfoRequest,
-    NodeInfoResponse, RecordAddressesRequest, RecordAddressesResponse, RestartRequest,
-    RestartResponse, StopRequest, StopResponse, UpdateRequest, UpdateResponse,
+    NodeInfoResponse, RecordAddressesRequest, RecordAddressesResponse,
 };
 
 // this includes code generated from .proto files
@@ -41,7 +33,6 @@ struct SafeNodeRpcService {
     addr: SocketAddr,
     log_dir: String,
     running_node: RunningNode,
-    ctrl_tx: Sender<NodeCtrl>,
     started_instant: Instant,
 }
 
@@ -221,78 +212,12 @@ impl SafeNode for SafeNodeRpcService {
             )),
         }
     }
-
-    async fn stop(&self, request: Request<StopRequest>) -> Result<Response<StopResponse>, Status> {
-        trace!(
-            "RPC request received at {}: {:?}",
-            self.addr,
-            request.get_ref()
-        );
-
-        let cause = if let Some(addr) = request.remote_addr() {
-            ErrReport::msg(format!(
-                "Node has been stopped by an RPC request from {addr}."
-            ))
-        } else {
-            ErrReport::msg("Node has been stopped by an RPC request from an unknown address.")
-        };
-
-        let delay = Duration::from_millis(request.get_ref().delay_millis);
-        match self.ctrl_tx.send(NodeCtrl::Stop { delay, cause }).await {
-            Ok(()) => Ok(Response::new(StopResponse {})),
-            Err(err) => Err(Status::new(
-                Code::Internal,
-                format!("Failed to stop the node: {err}"),
-            )),
-        }
-    }
-
-    async fn restart(
-        &self,
-        request: Request<RestartRequest>,
-    ) -> Result<Response<RestartResponse>, Status> {
-        trace!(
-            "RPC request received at {}: {:?}",
-            self.addr,
-            request.get_ref()
-        );
-
-        let delay = Duration::from_millis(request.get_ref().delay_millis);
-        match self.ctrl_tx.send(NodeCtrl::Restart(delay)).await {
-            Ok(()) => Ok(Response::new(RestartResponse {})),
-            Err(err) => Err(Status::new(
-                Code::Internal,
-                format!("Failed to restart the node: {err}"),
-            )),
-        }
-    }
-
-    async fn update(
-        &self,
-        request: Request<UpdateRequest>,
-    ) -> Result<Response<UpdateResponse>, Status> {
-        trace!(
-            "RPC request received at {}: {:?}",
-            self.addr,
-            request.get_ref()
-        );
-
-        let delay = Duration::from_millis(request.get_ref().delay_millis);
-        match self.ctrl_tx.send(NodeCtrl::Update(delay)).await {
-            Ok(()) => Ok(Response::new(UpdateResponse {})),
-            Err(err) => Err(Status::new(
-                Code::Internal,
-                format!("Failed to update the node: {err}"),
-            )),
-        }
-    }
 }
 
 pub(super) fn start_rpc_service(
     addr: SocketAddr,
     log_dir: &str,
     running_node: RunningNode,
-    ctrl_tx: Sender<NodeCtrl>,
     started_instant: Instant,
 ) {
     // creating a service
@@ -300,7 +225,6 @@ pub(super) fn start_rpc_service(
         addr,
         log_dir: log_dir.to_string(),
         running_node,
-        ctrl_tx,
         started_instant,
     };
     info!("RPC Server listening on {addr}");

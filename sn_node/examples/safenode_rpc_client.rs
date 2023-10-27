@@ -12,7 +12,7 @@ use libp2p::{Multiaddr, PeerId};
 use safenode_proto::{
     safe_node_client::SafeNodeClient, GossipsubPublishRequest, GossipsubSubscribeRequest,
     GossipsubUnsubscribeRequest, NetworkInfoRequest, NodeEventsRequest, NodeInfoRequest,
-    RecordAddressesRequest, RestartRequest, StopRequest, UpdateRequest,
+    RecordAddressesRequest,
 };
 use sn_logging::LogBuilder;
 use sn_node::NodeEvent;
@@ -80,27 +80,6 @@ enum Cmd {
         /// Message to publish
         msg: String,
     },
-    /// Restart the node after the specified delay
-    #[clap(name = "restart")]
-    Restart {
-        /// Delay in milliseconds before restartng the node
-        #[clap(default_value = "0")]
-        delay_millis: u64,
-    },
-    /// Stop the node after the specified delay
-    #[clap(name = "stop")]
-    Stop {
-        /// Delay in milliseconds before stopping the node
-        #[clap(default_value = "0")]
-        delay_millis: u64,
-    },
-    /// Update to latest `safenode` released version, and restart it
-    #[clap(name = "update")]
-    Update {
-        /// Delay in milliseconds before updating and restarting the node
-        #[clap(default_value = "0")]
-        delay_millis: u64,
-    },
 }
 
 #[tokio::main]
@@ -125,9 +104,6 @@ async fn main() -> Result<()> {
         Cmd::Subscribe { topic } => gossipsub_subscribe(addr, topic).await,
         Cmd::Unsubscribe { topic } => gossipsub_unsubscribe(addr, topic).await,
         Cmd::Publish { topic, msg } => gossipsub_publish(addr, topic, msg).await,
-        Cmd::Restart { delay_millis } => node_restart(addr, delay_millis).await,
-        Cmd::Stop { delay_millis } => node_stop(addr, delay_millis).await,
-        Cmd::Update { delay_millis } => node_update(addr, delay_millis).await,
     }
 }
 
@@ -295,44 +271,5 @@ pub async fn gossipsub_publish(addr: SocketAddr, topic: String, msg: String) -> 
         }))
         .await?;
     println!("Node successfully received the request to publish on topic '{topic}'");
-    Ok(())
-}
-
-pub async fn node_restart(addr: SocketAddr, delay_millis: u64) -> Result<()> {
-    let endpoint = format!("https://{addr}");
-    let mut client = SafeNodeClient::connect(endpoint).await?;
-    let _response = client
-        .restart(Request::new(RestartRequest { delay_millis }))
-        .await?;
-    println!(
-        "Node successfully received the request to restart in {:?}",
-        Duration::from_millis(delay_millis)
-    );
-    Ok(())
-}
-
-pub async fn node_stop(addr: SocketAddr, delay_millis: u64) -> Result<()> {
-    let endpoint = format!("https://{addr}");
-    let mut client = SafeNodeClient::connect(endpoint).await?;
-    let _response = client
-        .stop(Request::new(StopRequest { delay_millis }))
-        .await?;
-    println!(
-        "Node successfully received the request to stop in {:?}",
-        Duration::from_millis(delay_millis)
-    );
-    Ok(())
-}
-
-pub async fn node_update(addr: SocketAddr, delay_millis: u64) -> Result<()> {
-    let endpoint = format!("https://{addr}");
-    let mut client = SafeNodeClient::connect(endpoint).await?;
-    let _response = client
-        .update(Request::new(UpdateRequest { delay_millis }))
-        .await?;
-    println!(
-        "Node successfully received the request to try to update in {:?}",
-        Duration::from_millis(delay_millis)
-    );
     Ok(())
 }

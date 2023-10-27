@@ -219,3 +219,15 @@ run-local-network:
   pgrep faucet | xargs kill -9
   rm -rf ~/.local/share/safe
   cargo run --bin testnet --features local-discovery -- --build-node --build-faucet --interval 1000
+
+install-safenode-windows-service:
+  #!powershell
+  cargo build --release --bin safenode
+  New-Item -Path "C:\\Temp" -ItemType Directory -Force
+  Remove-Item -Path "C:\\Temp\\safenode" -Recurse -Force
+  New-Item -Path "C:\\Temp\\safenode" -ItemType Directory -Force
+  New-Item -Path "C:\\Temp\\safenode\\logs" -ItemType Directory -Force
+  New-Item -Path "C:\\Temp\\safenode\\root" -ItemType Directory -Force
+  cp target\release\safenode.exe C:\Temp
+  cp safenode4.xml C:\Temp
+  sc.exe create safenode4 binPath= "C:\\Temp\\safenode.exe --rpc 127.0.0.1:12500 --run-as-service" start= auto

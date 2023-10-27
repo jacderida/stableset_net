@@ -66,25 +66,3 @@ message GossipsubPublishRequest {
 }
 
 message GossipsubPublishResponse {}
-
-// Stop the safenode app
-message StopRequest {
-  uint64 delay_millis = 1;
-}
-
-message StopResponse {}
-
-// Restart the safenode app
-message RestartRequest {
-  uint64 delay_millis = 1;
-}
-
-message RestartResponse {}
-
-// Update the safenode app
-message UpdateRequest {
-  uint64 delay_millis = 1;
-}
-
-message UpdateResponse {}
-
