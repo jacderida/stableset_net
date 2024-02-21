@@ -73,6 +73,7 @@ async fn add_faucet_should_add_a_faucet_service() -> Result<()> {
             args: vec![
                 OsString::from("--log-output-dest"),
                 OsString::from(faucet_logs_dir.to_path_buf().as_os_str()),
+                OsString::from("server"),
             ],
             environment: Some(vec![("SN_LOG".to_string(), "all".to_string())]),
             contents: None,
