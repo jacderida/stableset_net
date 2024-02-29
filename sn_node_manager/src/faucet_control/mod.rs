@@ -13,10 +13,10 @@ mod tests;
 pub use config::AddFaucetServiceOptions;
 
 use self::config::InstallFaucetServiceCtxBuilder;
-use crate::{config::create_owned_dir, service::ServiceControl, VerbosityLevel};
+use crate::{config::create_owned_dir, VerbosityLevel};
 use color_eyre::{eyre::OptionExt, Result};
 use colored::Colorize;
-use sn_service_management::{Faucet, NodeRegistry, NodeStatus};
+use sn_service_management::{control::ServiceControl, Faucet, NodeRegistry, ServiceStatus};
 
 /// Install the faucet as a service.
 ///
@@ -59,7 +59,7 @@ pub fn add_faucet(
                 log_dir_path: install_options.service_log_dir_path.clone(),
                 pid: None,
                 service_name: "faucet".to_string(),
-                status: NodeStatus::Added,
+                status: ServiceStatus::Added,
                 user: install_options.user.clone(),
                 version: install_options.version,
             });
@@ -85,7 +85,7 @@ pub fn add_faucet(
         }
         Err(e) => {
             println!("Failed to add faucet service: {e}");
-            Err(e)
+            Err(e.into())
         }
     }
 }
@@ -95,7 +95,7 @@ pub async fn start_faucet(
     service_control: &dyn ServiceControl,
     verbosity: VerbosityLevel,
 ) -> Result<()> {
-    if let NodeStatus::Running = faucet.status {
+    if let ServiceStatus::Running = faucet.status {
         if service_control.is_service_process_running(faucet.pid.unwrap()) {
             println!("The {} service is already running", faucet.service_name);
             return Ok(());
@@ -109,7 +109,7 @@ pub async fn start_faucet(
 
     let pid = service_control.get_process_pid(&faucet.service_name)?;
     faucet.pid = Some(pid);
-    faucet.status = NodeStatus::Running;
+    faucet.status = ServiceStatus::Running;
 
     println!("{} Started faucet service", "✓".green());
     if verbosity != VerbosityLevel::Minimal {
@@ -122,15 +122,15 @@ pub async fn start_faucet(
 
 pub async fn stop_faucet(faucet: &mut Faucet, service_control: &dyn ServiceControl) -> Result<()> {
     match faucet.status {
-        NodeStatus::Added => {
+        ServiceStatus::Added => {
             println!("The faucet has not been started since it was installed");
             Ok(())
         }
-        NodeStatus::Removed => {
+        ServiceStatus::Removed => {
             println!("The faucet service was removed");
             Ok(())
         }
-        NodeStatus::Running => {
+        ServiceStatus::Running => {
             let pid = faucet.pid.ok_or_eyre("The PID was not set")?;
             if service_control.is_service_process_running(pid) {
                 println!("Attempting to stop {}...", faucet.service_name);
@@ -149,10 +149,10 @@ pub async fn stop_faucet(faucet: &mut Faucet, service_control: &dyn ServiceContr
                 );
             }
             faucet.pid = None;
-            faucet.status = NodeStatus::Stopped;
+            faucet.status = ServiceStatus::Stopped;
             Ok(())
         }
-        NodeStatus::Stopped => {
+        ServiceStatus::Stopped => {
             println!("{} The faucet was already stopped", "✓".green(),);
             Ok(())
         }

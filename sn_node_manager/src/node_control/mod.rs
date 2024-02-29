@@ -12,7 +12,7 @@ mod tests;
 
 pub use config::{AddServiceOptions, InstallNodeServiceCtxBuilder, UpgradeOptions};
 
-use crate::{config::create_owned_dir, service::ServiceControl, VerbosityLevel};
+use crate::{config::create_owned_dir, VerbosityLevel};
 use color_eyre::{
     eyre::{eyre, OptionExt},
     Help, Result,
@@ -20,8 +20,11 @@ use color_eyre::{
 use colored::Colorize;
 use libp2p::multiaddr::Protocol;
 use semver::Version;
-use sn_node_rpc_client::{RpcActions, RpcClient};
-use sn_service_management::{Node, NodeRegistry, NodeStatus};
+use sn_service_management::{
+    control::ServiceControl,
+    rpc::{RpcActions, RpcClient},
+    NodeRegistry, NodeServiceData, ServiceStatus,
+};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 pub enum UpgradeResult {
@@ -152,7 +155,7 @@ pub async fn add(
                     rpc_socket_addr,
                 ));
 
-                node_registry.nodes.push(Node {
+                node_registry.nodes.push(NodeServiceData {
                     genesis: options.genesis,
                     local: options.local,
                     service_name,
@@ -160,7 +163,7 @@ pub async fn add(
                     number: node_number,
                     rpc_socket_addr,
                     version: options.version.clone(),
-                    status: NodeStatus::Added,
+                    status: ServiceStatus::Added,
                     listen_addr: None,
                     pid: None,
                     peer_id: None,
@@ -210,12 +213,12 @@ pub async fn add(
 }
 
 pub async fn start(
-    node: &mut Node,
+    node: &mut NodeServiceData,
     service_control: &dyn ServiceControl,
     rpc_client: &dyn RpcActions,
     verbosity: VerbosityLevel,
 ) -> Result<()> {
-    if let NodeStatus::Running = node.status {
+    if let ServiceStatus::Running = node.status {
         // The last time we checked the service was running, but it doesn't mean it's actually
         // running at this point in time. If it is running, we don't need to do anything. If it
         // stopped because of a fault, we will drop to the code below and attempt to start it
@@ -246,7 +249,7 @@ pub async fn start(
     );
     node.pid = Some(node_info.pid);
     node.peer_id = Some(node_info.peer_id);
-    node.status = NodeStatus::Running;
+    node.status = ServiceStatus::Running;
 
     println!("{} Started {} service", "✓".green(), node.service_name);
     if verbosity != VerbosityLevel::Minimal {
@@ -257,17 +260,17 @@ pub async fn start(
     Ok(())
 }
 
-pub async fn stop(node: &mut Node, service_control: &dyn ServiceControl) -> Result<()> {
+pub async fn stop(node: &mut NodeServiceData, service_control: &dyn ServiceControl) -> Result<()> {
     match node.status {
-        NodeStatus::Added => {
+        ServiceStatus::Added => {
             println!(
                 "Service {} has not been started since it was installed",
                 node.service_name
             );
             Ok(())
         }
-        NodeStatus::Removed => Err(eyre!("Service {} has been removed", node.service_name)),
-        NodeStatus::Running => {
+        ServiceStatus::Removed => Err(eyre!("Service {} has been removed", node.service_name)),
+        ServiceStatus::Running => {
             let pid = node.pid.ok_or_eyre("The PID was not set")?;
             if service_control.is_service_process_running(pid) {
                 println!("Attempting to stop {}...", node.service_name);
@@ -286,11 +289,11 @@ pub async fn stop(node: &mut Node, service_control: &dyn ServiceControl) -> Resu
                 );
             }
             node.pid = None;
-            node.status = NodeStatus::Stopped;
+            node.status = ServiceStatus::Stopped;
             node.connected_peers = None;
             Ok(())
         }
-        NodeStatus::Stopped => {
+        ServiceStatus::Stopped => {
             println!(
                 "{} Service {} was already stopped",
                 "✓".green(),
@@ -312,7 +315,7 @@ pub async fn status(
     // If they aren't we'll mark them as stopped.
     for node in &mut node_registry.nodes {
         let rpc_client = RpcClient::from_socket_addr(node.rpc_socket_addr);
-        if let NodeStatus::Running = node.status {
+        if let ServiceStatus::Running = node.status {
             if let Some(pid) = node.pid {
                 // First we can try the PID we have now. If there is still a process running with
                 // that PID, we know the node is still running.
@@ -337,7 +340,7 @@ pub async fn status(
                         Err(_) => {
                             // Finally, if there was an error communicating with the RPC client, we
                             // can assume that this node is actually stopped.
-                            node.status = NodeStatus::Stopped;
+                            node.status = ServiceStatus::Stopped;
                             node.pid = None;
                         }
                     }
@@ -394,8 +397,8 @@ pub async fn status(
         let nodes = node_registry
             .nodes
             .iter()
-            .filter(|n| n.status != NodeStatus::Removed)
-            .collect::<Vec<&Node>>();
+            .filter(|n| n.status != ServiceStatus::Removed)
+            .collect::<Vec<&NodeServiceData>>();
         for node in nodes {
             let peer_id = node.peer_id.map_or("-".to_string(), |p| p.to_string());
             let connected_peers = node
@@ -416,7 +419,7 @@ pub async fn status(
         && node_registry
             .nodes
             .iter()
-            .any(|n| n.status != NodeStatus::Running)
+            .any(|n| n.status != ServiceStatus::Running)
     {
         return Err(eyre!("One or more nodes are not in a running state"));
     }
@@ -425,11 +428,11 @@ pub async fn status(
 }
 
 pub async fn remove(
-    node: &mut Node,
+    node: &mut NodeServiceData,
     service_control: &dyn ServiceControl,
     keep_directories: bool,
 ) -> Result<()> {
-    if let NodeStatus::Running = node.status {
+    if let ServiceStatus::Running = node.status {
         if service_control.is_service_process_running(
             node.pid
                 .ok_or_else(|| eyre!("The PID should be set before the node is removed"))?,
@@ -440,7 +443,7 @@ pub async fn remove(
             // If the node wasn't actually running, we should give the user an opportunity to
             // check why it may have failed before removing everything.
             node.pid = None;
-            node.status = NodeStatus::Stopped;
+            node.status = ServiceStatus::Stopped;
             return Err(
                 eyre!("This node was marked as running but it had actually stopped")
                     .suggestion("You may want to check the logs for errors before removing it")
@@ -456,7 +459,7 @@ pub async fn remove(
         std::fs::remove_dir_all(&node.log_dir_path)?;
     }
 
-    node.status = NodeStatus::Removed;
+    node.status = ServiceStatus::Removed;
 
     println!("{} Service {} was removed", "✓".green(), node.service_name);
 
@@ -465,7 +468,7 @@ pub async fn remove(
 
 pub async fn upgrade(
     options: UpgradeOptions,
-    node: &mut Node,
+    node: &mut NodeServiceData,
     service_control: &dyn ServiceControl,
     rpc_client: &dyn RpcActions,
 ) -> Result<UpgradeResult> {
@@ -515,11 +518,11 @@ pub async fn upgrade(
     }
 }
 
-fn format_status(status: &NodeStatus) -> String {
+fn format_status(status: &ServiceStatus) -> String {
     match status {
-        NodeStatus::Running => "RUNNING".green().to_string(),
-        NodeStatus::Stopped => "STOPPED".red().to_string(),
-        NodeStatus::Added => "ADDED".yellow().to_string(),
-        NodeStatus::Removed => "REMOVED".red().to_string(),
+        ServiceStatus::Running => "RUNNING".green().to_string(),
+        ServiceStatus::Stopped => "STOPPED".red().to_string(),
+        ServiceStatus::Added => "ADDED".yellow().to_string(),
+        ServiceStatus::Removed => "REMOVED".red().to_string(),
     }
 }

@@ -10,9 +10,8 @@ use crate::{
     node_control::{
         add,
         config::{AddServiceOptions, InstallNodeServiceCtxBuilder},
-        remove, start, stop,
+        remove, stop,
     },
-    service::MockServiceControl,
     VerbosityLevel,
 };
 use assert_fs::prelude::*;
@@ -23,15 +22,14 @@ use libp2p::Multiaddr;
 use libp2p_identity::PeerId;
 use mockall::{mock, predicate::*, Sequence};
 use predicates::prelude::*;
-use sn_node_rpc_client::{NetworkInfo, NodeInfo, RecordAddress, Result as RpcResult, RpcActions};
-use sn_releases::{
-    ArchiveType, Platform, ProgressCallback, ReleaseType, Result as SnReleaseResult,
-    SafeReleaseRepositoryInterface,
-};
-use sn_service_management::{Node, NodeRegistry, NodeStatus};
+use service_manager::ServiceInstallCtx;
+use sn_service_management::control::ServiceControl;
+use sn_service_management::error::Result as ServiceControlResult;
+use sn_service_management::rpc::{NetworkInfo, NodeInfo, RecordAddress, RpcActions};
+use sn_service_management::{NodeRegistry, NodeServiceData, ServiceStatus};
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    path::{Path, PathBuf},
+    path::PathBuf,
     str::FromStr,
 };
 
@@ -41,26 +39,17 @@ const SAFENODE_FILE_NAME: &str = "safenode";
 const SAFENODE_FILE_NAME: &str = "safenode.exe";
 
 mock! {
-    pub SafeReleaseRepository {}
-    #[async_trait]
-    impl SafeReleaseRepositoryInterface for SafeReleaseRepository {
-        async fn get_latest_version(&self, release_type: &ReleaseType) -> SnReleaseResult<String>;
-        async fn download_release_from_s3(
-            &self,
-            release_type: &ReleaseType,
-            version: &str,
-            platform: &Platform,
-            archive_type: &ArchiveType,
-            download_dir: &Path,
-            callback: &ProgressCallback
-        ) -> SnReleaseResult<PathBuf>;
-        async fn download_release(
-            &self,
-            url: &str,
-            dest_dir_path: &Path,
-            callback: &ProgressCallback,
-        ) -> SnReleaseResult<PathBuf>;
-        fn extract_release_archive(&self, archive_path: &Path, extract_dir: &Path) -> SnReleaseResult<PathBuf>;
+    pub ServiceControl {}
+    impl ServiceControl for ServiceControl {
+        fn create_service_user(&self, username: &str) -> ServiceControlResult<()>;
+        fn get_available_port(&self) -> ServiceControlResult<u16>;
+        fn install(&self, install_ctx: ServiceInstallCtx) -> ServiceControlResult<()>;
+        fn get_process_pid(&self, name: &str) -> ServiceControlResult<u32>;
+        fn is_service_process_running(&self, pid: u32) -> bool;
+        fn start(&self, service_name: &str) -> ServiceControlResult<()>;
+        fn stop(&self, service_name: &str) -> ServiceControlResult<()>;
+        fn uninstall(&self, service_name: &str) -> ServiceControlResult<()>;
+        fn wait(&self, delay: u64);
     }
 }
 
@@ -175,7 +164,7 @@ async fn add_genesis_node_should_use_latest_version_and_add_one_service() -> Res
         node_registry.nodes[0].data_dir_path,
         node_data_dir.to_path_buf().join("safenode1")
     );
-    assert_matches!(node_registry.nodes[0].status, NodeStatus::Added);
+    assert_matches!(node_registry.nodes[0].status, ServiceStatus::Added);
 
     Ok(())
 }
@@ -192,7 +181,7 @@ async fn add_genesis_node_should_return_an_error_if_there_is_already_a_genesis_n
     let mut node_registry = NodeRegistry {
         faucet: None,
         save_path: node_reg_path.to_path_buf(),
-        nodes: vec![Node {
+        nodes: vec![NodeServiceData {
             genesis: true,
             local: false,
             service_name: "safenode1".to_string(),
@@ -200,7 +189,7 @@ async fn add_genesis_node_should_return_an_error_if_there_is_already_a_genesis_n
             number: 1,
             rpc_socket_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8081),
             version: latest_version.to_string(),
-            status: NodeStatus::Added,
+            status: ServiceStatus::Added,
             listen_addr: None,
             pid: None,
             peer_id: None,
@@ -474,7 +463,7 @@ async fn add_node_should_use_latest_version_and_add_three_services() -> Result<(
         node_registry.nodes[0].data_dir_path,
         node_data_dir.to_path_buf().join("safenode1")
     );
-    assert_matches!(node_registry.nodes[0].status, NodeStatus::Added);
+    assert_matches!(node_registry.nodes[0].status, ServiceStatus::Added);
     assert_eq!(node_registry.nodes[1].version, latest_version);
     assert_eq!(node_registry.nodes[1].service_name, "safenode2");
     assert_eq!(node_registry.nodes[1].user, get_username());
@@ -491,7 +480,7 @@ async fn add_node_should_use_latest_version_and_add_three_services() -> Result<(
         node_registry.nodes[1].data_dir_path,
         node_data_dir.to_path_buf().join("safenode2")
     );
-    assert_matches!(node_registry.nodes[1].status, NodeStatus::Added);
+    assert_matches!(node_registry.nodes[1].status, ServiceStatus::Added);
     assert_eq!(node_registry.nodes[2].version, latest_version);
     assert_eq!(node_registry.nodes[2].service_name, "safenode3");
     assert_eq!(node_registry.nodes[2].user, get_username());
@@ -508,7 +497,7 @@ async fn add_node_should_use_latest_version_and_add_three_services() -> Result<(
         node_registry.nodes[2].data_dir_path,
         node_data_dir.to_path_buf().join("safenode3")
     );
-    assert_matches!(node_registry.nodes[2].status, NodeStatus::Added);
+    assert_matches!(node_registry.nodes[2].status, ServiceStatus::Added);
 
     Ok(())
 }
@@ -619,7 +608,7 @@ async fn add_node_should_update_the_bootstrap_peers_inside_node_registry() -> Re
         node_registry.nodes[0].data_dir_path,
         node_data_dir.to_path_buf().join("safenode1")
     );
-    assert_matches!(node_registry.nodes[0].status, NodeStatus::Added);
+    assert_matches!(node_registry.nodes[0].status, ServiceStatus::Added);
 
     Ok(())
 }
@@ -730,7 +719,7 @@ async fn add_node_should_update_the_environment_variables_inside_node_registry()
         node_registry.nodes[0].data_dir_path,
         node_data_dir.to_path_buf().join("safenode1")
     );
-    assert_matches!(node_registry.nodes[0].status, NodeStatus::Added);
+    assert_matches!(node_registry.nodes[0].status, ServiceStatus::Added);
 
     Ok(())
 }
@@ -746,7 +735,7 @@ async fn add_new_node_should_add_another_service() -> Result<()> {
     let mut node_registry = NodeRegistry {
         faucet: None,
         save_path: node_reg_path.to_path_buf(),
-        nodes: vec![Node {
+        nodes: vec![NodeServiceData {
             genesis: true,
             local: false,
             service_name: "safenode1".to_string(),
@@ -754,7 +743,7 @@ async fn add_new_node_should_add_another_service() -> Result<()> {
             number: 1,
             rpc_socket_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8081),
             version: latest_version.to_string(),
-            status: NodeStatus::Added,
+            status: ServiceStatus::Added,
             pid: None,
             peer_id: None,
             listen_addr: None,
@@ -846,7 +835,7 @@ async fn add_new_node_should_add_another_service() -> Result<()> {
         node_registry.nodes[1].data_dir_path,
         node_data_dir.to_path_buf().join("safenode2")
     );
-    assert_matches!(node_registry.nodes[0].status, NodeStatus::Added);
+    assert_matches!(node_registry.nodes[0].status, ServiceStatus::Added);
 
     Ok(())
 }
@@ -953,7 +942,7 @@ async fn add_node_should_use_custom_ports_for_one_service() -> Result<()> {
         node_registry.nodes[0].data_dir_path,
         node_data_dir.to_path_buf().join("safenode1")
     );
-    assert_matches!(node_registry.nodes[0].status, NodeStatus::Added);
+    assert_matches!(node_registry.nodes[0].status, ServiceStatus::Added);
 
     Ok(())
 }
@@ -1021,274 +1010,16 @@ mock! {
     pub RpcClient {}
     #[async_trait]
     impl RpcActions for RpcClient {
-        async fn node_info(&self) -> RpcResult<NodeInfo>;
-        async fn network_info(&self) -> RpcResult<NetworkInfo>;
-        async fn record_addresses(&self) -> RpcResult<Vec<RecordAddress>>;
-        async fn gossipsub_subscribe(&self, topic: &str) -> RpcResult<()>;
-        async fn gossipsub_unsubscribe(&self, topic: &str) -> RpcResult<()>;
-        async fn gossipsub_publish(&self, topic: &str, message: &str) -> RpcResult<()>;
-        async fn node_restart(&self, delay_millis: u64, retain_peer_id: bool) -> RpcResult<()>;
-        async fn node_stop(&self, delay_millis: u64) -> RpcResult<()>;
-        async fn node_update(&self, delay_millis: u64) -> RpcResult<()>;
+        async fn node_info(&self) -> ServiceControlResult<NodeInfo>;
+        async fn network_info(&self) -> ServiceControlResult<NetworkInfo>;
+        async fn record_addresses(&self) -> ServiceControlResult<Vec<RecordAddress>>;
+        async fn gossipsub_subscribe(&self, topic: &str) -> ServiceControlResult<()>;
+        async fn gossipsub_unsubscribe(&self, topic: &str) -> ServiceControlResult<()>;
+        async fn gossipsub_publish(&self, topic: &str, message: &str) -> ServiceControlResult<()>;
+        async fn node_restart(&self, delay_millis: u64, retain_peer_id: bool) -> ServiceControlResult<()>;
+        async fn node_stop(&self, delay_millis: u64) -> ServiceControlResult<()>;
+        async fn node_update(&self, delay_millis: u64) -> ServiceControlResult<()>;
     }
-}
-
-#[tokio::test]
-async fn start_should_start_a_newly_installed_service() -> Result<()> {
-    let mut mock_service_control = MockServiceControl::new();
-    let mut mock_rpc_client = MockRpcClient::new();
-
-    mock_service_control
-        .expect_start()
-        .with(eq("Safenode service 1"))
-        .times(1)
-        .returning(|_| Ok(()));
-    mock_service_control
-        .expect_wait()
-        .with(eq(3000))
-        .times(1)
-        .returning(|_| ());
-    mock_rpc_client.expect_node_info().times(1).returning(|| {
-        Ok(NodeInfo {
-            pid: 1000,
-            peer_id: PeerId::from_str("12D3KooWS2tpXGGTmg2AHFiDh57yPQnat49YHnyqoggzXZWpqkCR")?,
-            data_path: PathBuf::from("~/.local/share/safe/service1"),
-            log_path: PathBuf::from("~/.local/share/safe/service1/logs"),
-            version: "0.98.1".to_string(),
-            uptime: std::time::Duration::from_secs(1), // the service was just started
-        })
-    });
-    mock_rpc_client
-        .expect_network_info()
-        .times(1)
-        .returning(|| {
-            Ok(NetworkInfo {
-                connected_peers: Vec::new(),
-                listeners: Vec::new(),
-            })
-        });
-
-    let mut node = Node {
-        genesis: false,
-        local: false,
-        version: "0.98.1".to_string(),
-        service_name: "Safenode service 1".to_string(),
-        user: "safe".to_string(),
-        number: 1,
-        rpc_socket_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8081),
-        status: NodeStatus::Added,
-        pid: None,
-        listen_addr: None,
-        peer_id: None,
-        log_dir_path: PathBuf::from("/var/log/safenode/safenode1"),
-        data_dir_path: PathBuf::from("/var/safenode-manager/services/safenode1"),
-        safenode_path: PathBuf::from("/var/safenode-manager/services/safenode1/safenode"),
-        connected_peers: None,
-    };
-    start(
-        &mut node,
-        &mock_service_control,
-        &mock_rpc_client,
-        VerbosityLevel::Normal,
-    )
-    .await?;
-
-    assert_eq!(node.pid, Some(1000));
-    assert_eq!(
-        node.peer_id,
-        Some(PeerId::from_str(
-            "12D3KooWS2tpXGGTmg2AHFiDh57yPQnat49YHnyqoggzXZWpqkCR"
-        )?)
-    );
-    assert_matches!(node.status, NodeStatus::Running);
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn start_should_start_a_stopped_service() -> Result<()> {
-    let mut mock_service_control = MockServiceControl::new();
-    let mut mock_rpc_client = MockRpcClient::new();
-
-    mock_service_control
-        .expect_start()
-        .with(eq("Safenode service 2"))
-        .times(1)
-        .returning(|_| Ok(()));
-    mock_service_control
-        .expect_wait()
-        .with(eq(3000))
-        .times(1)
-        .returning(|_| ());
-    mock_rpc_client.expect_node_info().times(1).returning(|| {
-        Ok(NodeInfo {
-            pid: 1001,
-            peer_id: PeerId::from_str("12D3KooWAAqZWsjhdZTX7tniJ7Dwye3nEbp1dx1wE96sbgL51obs")?,
-            data_path: PathBuf::from("~/.local/share/safe/service1"),
-            log_path: PathBuf::from("~/.local/share/safe/service1/logs"),
-            version: "0.98.1".to_string(),
-            uptime: std::time::Duration::from_secs(1),
-        })
-    });
-    mock_rpc_client
-        .expect_network_info()
-        .times(1)
-        .returning(|| {
-            Ok(NetworkInfo {
-                connected_peers: Vec::new(),
-                listeners: Vec::new(),
-            })
-        });
-
-    let mut node = Node {
-        genesis: false,
-        local: false,
-        version: "0.98.1".to_string(),
-        service_name: "Safenode service 2".to_string(),
-        user: "safe".to_string(),
-        number: 2,
-        rpc_socket_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8083),
-        status: NodeStatus::Stopped,
-        pid: Some(1001),
-        listen_addr: None,
-        peer_id: Some(PeerId::from_str(
-            "12D3KooWAAqZWsjhdZTX7tniJ7Dwye3nEbp1dx1wE96sbgL51obs",
-        )?),
-        log_dir_path: PathBuf::from("/var/log/safenode/safenode1"),
-        data_dir_path: PathBuf::from("/var/safenode-manager/services/safenode1"),
-        safenode_path: PathBuf::from("/var/safenode-manager/services/safenode1/safenode"),
-        connected_peers: None,
-    };
-    start(
-        &mut node,
-        &mock_service_control,
-        &mock_rpc_client,
-        VerbosityLevel::Normal,
-    )
-    .await?;
-
-    assert_matches!(node.status, NodeStatus::Running);
-    assert_eq!(node.pid, Some(1001));
-    assert_eq!(
-        node.peer_id,
-        Some(PeerId::from_str(
-            "12D3KooWAAqZWsjhdZTX7tniJ7Dwye3nEbp1dx1wE96sbgL51obs"
-        )?)
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn start_should_not_attempt_to_start_a_running_service() -> Result<()> {
-    let mut mock_service_control = MockServiceControl::new();
-    let mut mock_rpc_client = MockRpcClient::new();
-
-    mock_service_control
-        .expect_is_service_process_running()
-        .with(eq(1000))
-        .times(1)
-        .returning(|_| true);
-    mock_service_control
-        .expect_start()
-        .with(eq("Safenode service 1"))
-        .times(0)
-        .returning(|_| Ok(()));
-    mock_rpc_client.expect_node_info().times(0).returning(|| {
-        Ok(NodeInfo {
-            pid: 1001,
-            peer_id: PeerId::from_str("12D3KooWS2tpXGGTmg2AHFiDh57yPQnat49YHnyqoggzXZWpqkCR")?,
-            data_path: PathBuf::from("~/.local/share/safe/service1"),
-            log_path: PathBuf::from("~/.local/share/safe/service1/logs"),
-            version: "0.98.1".to_string(),
-            uptime: std::time::Duration::from_secs(24 * 60 * 60),
-        })
-    });
-
-    let mut node = Node {
-        genesis: false,
-        local: false,
-        version: "0.98.1".to_string(),
-        service_name: "Safenode service 1".to_string(),
-        user: "safe".to_string(),
-        number: 1,
-        rpc_socket_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8081),
-        status: NodeStatus::Running,
-        pid: Some(1000),
-        listen_addr: None,
-        peer_id: Some(PeerId::from_str(
-            "12D3KooWS2tpXGGTmg2AHFiDh57yPQnat49YHnyqoggzXZWpqkCR",
-        )?),
-        log_dir_path: PathBuf::from("/var/log/safenode/safenode1"),
-        data_dir_path: PathBuf::from("/var/safenode-manager/services/safenode1"),
-        safenode_path: PathBuf::from("/var/safenode-manager/services/safenode1/safenode"),
-        connected_peers: None,
-    };
-    start(
-        &mut node,
-        &mock_service_control,
-        &mock_rpc_client,
-        VerbosityLevel::Normal,
-    )
-    .await?;
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn start_should_start_a_service_marked_as_running_but_had_since_stopped() -> Result<()> {
-    let mut mock_service_control = MockServiceControl::new();
-    let mut mock_rpc_client = MockRpcClient::new();
-
-    mock_service_control
-        .expect_is_service_process_running()
-        .with(eq(1000))
-        .times(1)
-        .returning(|_| true);
-    mock_service_control
-        .expect_start()
-        .with(eq("Safenode service 1"))
-        .times(0)
-        .returning(|_| Ok(()));
-    mock_rpc_client.expect_node_info().times(0).returning(|| {
-        Ok(NodeInfo {
-            pid: 1002,
-            peer_id: PeerId::from_str("12D3KooWS2tpXGGTmg2AHFiDh57yPQnat49YHnyqoggzXZWpqkCR")?,
-            data_path: PathBuf::from("~/.local/share/safe/service1"),
-            log_path: PathBuf::from("~/.local/share/safe/service1/logs"),
-            version: "0.98.1".to_string(),
-            uptime: std::time::Duration::from_secs(1),
-        })
-    });
-
-    let mut node = Node {
-        genesis: false,
-        local: false,
-        version: "0.98.1".to_string(),
-        service_name: "Safenode service 1".to_string(),
-        user: "safe".to_string(),
-        number: 1,
-        rpc_socket_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8081),
-        status: NodeStatus::Running,
-        listen_addr: None,
-        pid: Some(1000),
-        peer_id: Some(PeerId::from_str(
-            "12D3KooWS2tpXGGTmg2AHFiDh57yPQnat49YHnyqoggzXZWpqkCR",
-        )?),
-        log_dir_path: PathBuf::from("/var/log/safenode/safenode1"),
-        data_dir_path: PathBuf::from("/var/safenode-manager/services/safenode1"),
-        safenode_path: PathBuf::from("/var/safenode-manager/services/safenode1/safenode"),
-        connected_peers: None,
-    };
-    start(
-        &mut node,
-        &mock_service_control,
-        &mock_rpc_client,
-        VerbosityLevel::Normal,
-    )
-    .await?;
-
-    Ok(())
 }
 
 #[tokio::test]
@@ -1309,7 +1040,7 @@ async fn stop_should_stop_a_running_service() -> Result<()> {
         .returning(|_| Ok(()))
         .in_sequence(&mut seq);
 
-    let mut node = Node {
+    let mut node = NodeServiceData {
         genesis: false,
         local: false,
         version: "0.98.1".to_string(),
@@ -1317,7 +1048,7 @@ async fn stop_should_stop_a_running_service() -> Result<()> {
         user: "safe".to_string(),
         number: 1,
         rpc_socket_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8081),
-        status: NodeStatus::Running,
+        status: ServiceStatus::Running,
         pid: Some(1000),
         listen_addr: None,
         peer_id: Some(PeerId::from_str(
@@ -1340,7 +1071,7 @@ async fn stop_should_stop_a_running_service() -> Result<()> {
             "12D3KooWS2tpXGGTmg2AHFiDh57yPQnat49YHnyqoggzXZWpqkCR"
         )?)
     );
-    assert_matches!(node.status, NodeStatus::Stopped);
+    assert_matches!(node.status, ServiceStatus::Stopped);
     assert_matches!(node.connected_peers, None);
 
     Ok(())
@@ -1350,7 +1081,7 @@ async fn stop_should_stop_a_running_service() -> Result<()> {
 async fn stop_should_not_return_error_for_attempt_to_stop_installed_service() -> Result<()> {
     let mock_service_control = MockServiceControl::new();
 
-    let mut node = Node {
+    let mut node = NodeServiceData {
         genesis: false,
         local: false,
         version: "0.98.1".to_string(),
@@ -1358,7 +1089,7 @@ async fn stop_should_not_return_error_for_attempt_to_stop_installed_service() ->
         user: "safe".to_string(),
         number: 1,
         rpc_socket_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8081),
-        status: NodeStatus::Added,
+        status: ServiceStatus::Added,
         pid: None,
         listen_addr: None,
         peer_id: None,
@@ -1383,7 +1114,7 @@ async fn stop_should_return_ok_when_attempting_to_stop_service_that_was_already_
 ) -> Result<()> {
     let mock_service_control = MockServiceControl::new();
 
-    let mut node = Node {
+    let mut node = NodeServiceData {
         genesis: false,
         local: false,
         version: "0.98.1".to_string(),
@@ -1391,7 +1122,7 @@ async fn stop_should_return_ok_when_attempting_to_stop_service_that_was_already_
         user: "safe".to_string(),
         number: 1,
         rpc_socket_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8081),
-        status: NodeStatus::Stopped,
+        status: ServiceStatus::Stopped,
         pid: None,
         peer_id: None,
         listen_addr: None,
@@ -1404,7 +1135,7 @@ async fn stop_should_return_ok_when_attempting_to_stop_service_that_was_already_
     stop(&mut node, &mock_service_control).await?;
 
     assert_eq!(node.pid, None);
-    assert_matches!(node.status, NodeStatus::Stopped);
+    assert_matches!(node.status, ServiceStatus::Stopped);
 
     Ok(())
 }
@@ -1426,7 +1157,7 @@ async fn remove_should_remove_an_added_node() -> Result<()> {
         .times(1)
         .returning(|_| Ok(()));
 
-    let mut node = Node {
+    let mut node = NodeServiceData {
         genesis: false,
         local: false,
         version: "0.98.1".to_string(),
@@ -1434,7 +1165,7 @@ async fn remove_should_remove_an_added_node() -> Result<()> {
         user: "safe".to_string(),
         number: 1,
         rpc_socket_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8081),
-        status: NodeStatus::Stopped,
+        status: ServiceStatus::Stopped,
         pid: None,
         peer_id: None,
         listen_addr: None,
@@ -1446,7 +1177,7 @@ async fn remove_should_remove_an_added_node() -> Result<()> {
 
     remove(&mut node, &mock_service_control, false).await?;
 
-    assert_matches!(node.status, NodeStatus::Removed);
+    assert_matches!(node.status, ServiceStatus::Removed);
     log_dir.assert(predicate::path::missing());
     data_dir.assert(predicate::path::missing());
 
@@ -1462,7 +1193,7 @@ async fn remove_should_return_an_error_if_attempting_to_remove_a_running_node() 
         .times(1)
         .returning(|_| true);
 
-    let mut node = Node {
+    let mut node = NodeServiceData {
         genesis: false,
         local: false,
         version: "0.98.1".to_string(),
@@ -1470,7 +1201,7 @@ async fn remove_should_return_an_error_if_attempting_to_remove_a_running_node() 
         user: "safe".to_string(),
         number: 1,
         rpc_socket_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8081),
-        status: NodeStatus::Running,
+        status: ServiceStatus::Running,
         pid: Some(1000),
         listen_addr: None,
         peer_id: Some(PeerId::from_str(
@@ -1509,7 +1240,7 @@ async fn remove_should_return_an_error_for_a_node_that_was_marked_running_but_wa
         .times(1)
         .returning(|_| false);
 
-    let mut node = Node {
+    let mut node = NodeServiceData {
         genesis: false,
         local: false,
         version: "0.98.1".to_string(),
@@ -1517,7 +1248,7 @@ async fn remove_should_return_an_error_for_a_node_that_was_marked_running_but_wa
         user: "safe".to_string(),
         number: 1,
         rpc_socket_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8081),
-        status: NodeStatus::Running,
+        status: ServiceStatus::Running,
         pid: Some(1000),
         listen_addr: None,
         peer_id: Some(PeerId::from_str(
@@ -1539,7 +1270,7 @@ async fn remove_should_return_an_error_for_a_node_that_was_marked_running_but_wa
     }
 
     assert_eq!(node.pid, None);
-    assert_matches!(node.status, NodeStatus::Stopped);
+    assert_matches!(node.status, ServiceStatus::Stopped);
 
     Ok(())
 }
@@ -1561,7 +1292,7 @@ async fn remove_should_remove_an_added_node_and_keep_directories() -> Result<()>
         .times(1)
         .returning(|_| Ok(()));
 
-    let mut node = Node {
+    let mut node = NodeServiceData {
         genesis: false,
         local: false,
         version: "0.98.1".to_string(),
@@ -1569,7 +1300,7 @@ async fn remove_should_remove_an_added_node_and_keep_directories() -> Result<()>
         user: "safe".to_string(),
         number: 1,
         rpc_socket_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8081),
-        status: NodeStatus::Stopped,
+        status: ServiceStatus::Stopped,
         pid: None,
         peer_id: None,
         listen_addr: None,
@@ -1583,7 +1314,7 @@ async fn remove_should_remove_an_added_node_and_keep_directories() -> Result<()>
 
     assert_eq!(node.data_dir_path, data_dir.to_path_buf());
     assert_eq!(node.log_dir_path, log_dir.to_path_buf());
-    assert_matches!(node.status, NodeStatus::Removed);
+    assert_matches!(node.status, ServiceStatus::Removed);
 
     log_dir.assert(predicate::path::is_dir());
     data_dir.assert(predicate::path::is_dir());

@@ -15,10 +15,10 @@ use libp2p_identity::PeerId;
 use sn_node_manager::{
     config::get_node_registry_path,
     daemon_control::{self, DAEMON_DEFAULT_PORT},
-    service::NodeServiceManager,
 };
-use sn_node_rpc_client::RpcClient;
 use sn_service_management::{
+    control::ServiceController,
+    rpc::RpcClient,
     safenode_manager_proto::{
         safe_node_manager_server::{SafeNodeManager, SafeNodeManagerServer},
         NodeServiceRestartRequest, NodeServiceRestartResponse,
@@ -99,7 +99,7 @@ impl SafeNodeManagerDaemon {
             peer_id,
             retain_peer_id,
             &rpc_client,
-            &NodeServiceManager {},
+            &ServiceController {},
         )
         .await;
 

@@ -8,16 +8,17 @@
 
 use crate::{
     faucet_control::{add_faucet, config::AddFaucetServiceOptions, start_faucet, stop_faucet},
-    service::MockServiceControl,
     VerbosityLevel,
 };
 use assert_fs::prelude::*;
 use assert_matches::assert_matches;
 use color_eyre::Result;
-use mockall::{predicate::*, Sequence};
+use mockall::{mock, predicate::*, Sequence};
 use predicates::prelude::*;
 use service_manager::ServiceInstallCtx;
-use sn_service_management::{Faucet, NodeRegistry, NodeStatus};
+use sn_service_management::control::ServiceControl;
+use sn_service_management::error::Result as ServiceControlResult;
+use sn_service_management::{Faucet, NodeRegistry, ServiceStatus};
 use std::ffi::OsString;
 use std::path::PathBuf;
 
@@ -34,6 +35,21 @@ fn get_username() -> String {
 #[cfg(not(target_os = "windows"))]
 fn get_username() -> String {
     std::env::var("USER").expect("Failed to get username")
+}
+
+mock! {
+    pub ServiceControl {}
+    impl ServiceControl for ServiceControl {
+        fn create_service_user(&self, username: &str) -> ServiceControlResult<()>;
+        fn get_available_port(&self) -> ServiceControlResult<u16>;
+        fn install(&self, install_ctx: ServiceInstallCtx) -> ServiceControlResult<()>;
+        fn get_process_pid(&self, name: &str) -> ServiceControlResult<u32>;
+        fn is_service_process_running(&self, pid: u32) -> bool;
+        fn start(&self, service_name: &str) -> ServiceControlResult<()>;
+        fn stop(&self, service_name: &str) -> ServiceControlResult<()>;
+        fn uninstall(&self, service_name: &str) -> ServiceControlResult<()>;
+        fn wait(&self, delay: u64);
+    }
 }
 
 #[tokio::test]
@@ -68,17 +84,17 @@ async fn add_faucet_should_add_a_faucet_service() -> Result<()> {
         .expect_install()
         .times(1)
         .with(eq(ServiceInstallCtx {
-            label: "faucet".parse()?,
-            program: faucet_install_path.to_path_buf(),
             args: vec![
                 OsString::from("--log-output-dest"),
                 OsString::from(faucet_logs_dir.to_path_buf().as_os_str()),
                 OsString::from("server"),
             ],
-            environment: Some(vec![("SN_LOG".to_string(), "all".to_string())]),
             contents: None,
-            working_directory: None,
+            environment: Some(vec![("SN_LOG".to_string(), "all".to_string())]),
+            label: "faucet".parse()?,
+            program: faucet_install_path.to_path_buf(),
             username: Some(get_username()),
+            working_directory: None,
         }))
         .returning(|_| Ok(()));
 
@@ -112,7 +128,7 @@ async fn add_faucet_should_add_a_faucet_service() -> Result<()> {
     assert_eq!(saved_faucet.log_dir_path, faucet_logs_dir.to_path_buf());
     assert!(saved_faucet.pid.is_none());
     assert_eq!(saved_faucet.service_name, "faucet");
-    assert_eq!(saved_faucet.status, NodeStatus::Added);
+    assert_eq!(saved_faucet.status, ServiceStatus::Added);
     assert_eq!(saved_faucet.user, get_username());
     assert_eq!(saved_faucet.version, latest_version);
 
@@ -140,7 +156,7 @@ async fn start_faucet_should_start_the_added_faucet_service() -> Result<()> {
         log_dir_path: PathBuf::from("/var/log/faucet"),
         pid: None,
         service_name: "faucet".to_string(),
-        status: NodeStatus::Added,
+        status: ServiceStatus::Added,
         user: "safe".to_string(),
         version: "0.98.1".to_string(),
     };
@@ -148,7 +164,7 @@ async fn start_faucet_should_start_the_added_faucet_service() -> Result<()> {
     start_faucet(&mut faucet, &mock_service_control, VerbosityLevel::Normal).await?;
 
     assert_eq!(faucet.pid, Some(100));
-    assert_matches!(faucet.status, NodeStatus::Running);
+    assert_matches!(faucet.status, ServiceStatus::Running);
 
     Ok(())
 }
@@ -177,14 +193,14 @@ async fn stop_faucet_should_stop_a_running_service() -> Result<()> {
         log_dir_path: PathBuf::from("/var/log/faucet"),
         pid: Some(1000),
         service_name: "faucet".to_string(),
-        status: NodeStatus::Running,
+        status: ServiceStatus::Running,
         user: "safe".to_string(),
         version: "0.98.1".to_string(),
     };
     stop_faucet(&mut faucet, &mock_service_control).await?;
 
     assert_eq!(faucet.pid, None);
-    assert_matches!(faucet.status, NodeStatus::Stopped);
+    assert_matches!(faucet.status, ServiceStatus::Stopped);
 
     Ok(())
 }
@@ -210,14 +226,14 @@ async fn stop_faucet_should_stop_a_service_marked_as_running() -> Result<()> {
         log_dir_path: PathBuf::from("/var/log/faucet"),
         pid: Some(1000),
         service_name: "faucet".to_string(),
-        status: NodeStatus::Running,
+        status: ServiceStatus::Running,
         user: "safe".to_string(),
         version: "0.98.1".to_string(),
     };
     stop_faucet(&mut faucet, &mock_service_control).await?;
 
     assert_eq!(faucet.pid, None);
-    assert_matches!(faucet.status, NodeStatus::Stopped);
+    assert_matches!(faucet.status, ServiceStatus::Stopped);
 
     Ok(())
 }
@@ -232,7 +248,7 @@ async fn stop_faucet_should_not_return_error_for_attempt_to_stop_installed_servi
         log_dir_path: PathBuf::from("/var/log/faucet"),
         pid: Some(1000),
         service_name: "faucet".to_string(),
-        status: NodeStatus::Added,
+        status: ServiceStatus::Added,
         user: "safe".to_string(),
         version: "0.98.1".to_string(),
     };
@@ -258,7 +274,7 @@ async fn stop_faucet_should_return_ok_when_attempting_to_stop_service_that_was_a
         log_dir_path: PathBuf::from("/var/log/faucet"),
         pid: None,
         service_name: "faucet".to_string(),
-        status: NodeStatus::Stopped,
+        status: ServiceStatus::Stopped,
         user: "safe".to_string(),
         version: "0.98.1".to_string(),
     };
@@ -266,7 +282,7 @@ async fn stop_faucet_should_return_ok_when_attempting_to_stop_service_that_was_a
     stop_faucet(&mut faucet, &mock_service_control).await?;
 
     assert_eq!(faucet.pid, None);
-    assert_matches!(faucet.status, NodeStatus::Stopped);
+    assert_matches!(faucet.status, ServiceStatus::Stopped);
 
     Ok(())
 }
@@ -281,7 +297,7 @@ async fn stop_faucet_should_not_return_error_for_attempt_to_stop_removed_service
         log_dir_path: PathBuf::from("/var/log/faucet"),
         pid: Some(1000),
         service_name: "faucet".to_string(),
-        status: NodeStatus::Removed,
+        status: ServiceStatus::Removed,
         user: "safe".to_string(),
         version: "0.98.1".to_string(),
     };

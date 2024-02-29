@@ -17,17 +17,20 @@ use sn_node_manager::{
     faucet_control::{add_faucet, start_faucet, stop_faucet, AddFaucetServiceOptions},
     helpers::download_and_extract_release,
     local::{kill_network, run_network, LocalNetworkOptions},
+    manager::ServiceManager,
     node_control::{
-        add, remove, start, status, stop, upgrade,
-        AddServiceOptions, UpgradeOptions, UpgradeResult,
+        add, remove, status, stop, upgrade, AddServiceOptions, UpgradeOptions, UpgradeResult,
     },
-    service::{NodeServiceManager, ServiceControl},
     VerbosityLevel,
 };
-use sn_node_rpc_client::RpcClient;
 use sn_peers_acquisition::{get_peers_from_args, PeersArgs};
 use sn_releases::{ReleaseType, SafeReleaseRepositoryInterface};
-use sn_service_management::{get_local_node_registry_path, NodeRegistry};
+use sn_service_management::{
+    control::{ServiceControl, ServiceController},
+    get_local_node_registry_path,
+    rpc::RpcClient,
+    NodeRegistry, NodeService,
+};
 use sn_transfers::get_faucet_data_dir;
 use std::{
     net::Ipv4Addr,
@@ -457,7 +460,7 @@ async fn main() -> Result<()> {
             }
 
             let service_user = user.unwrap_or("safe".to_string());
-            let service_manager = NodeServiceManager {};
+            let service_manager = ServiceController {};
             service_manager.create_service_user(&service_user)?;
 
             let service_data_dir_path = get_service_data_dir_path(data_dir_path, &service_user)?;
@@ -514,7 +517,7 @@ async fn main() -> Result<()> {
 
             let mut node_registry = NodeRegistry::load(&get_node_registry_path()?)?;
 
-            let service_manager = NodeServiceManager {};
+            let service_manager = ServiceController {};
             daemon_control::add_daemon(address, port, path, &mut node_registry, &service_manager)?;
 
             Ok(())
@@ -534,7 +537,7 @@ async fn main() -> Result<()> {
 
                 daemon_control::start_daemon(
                     &mut daemon,
-                    &NodeServiceManager {},
+                    &ServiceController {},
                     verbosity.clone(),
                 )?;
                 node_registry.daemon = Some(daemon);
@@ -557,7 +560,7 @@ async fn main() -> Result<()> {
                     println!("=================================================");
                 }
 
-                daemon_control::stop_daemon(&mut daemon, &NodeServiceManager {})?;
+                daemon_control::stop_daemon(&mut daemon, &ServiceController {})?;
                 node_registry.daemon = Some(daemon);
                 node_registry.save()?;
                 return Ok(());
@@ -584,7 +587,7 @@ async fn main() -> Result<()> {
                 }
 
                 let service_user = "safe";
-                let service_manager = NodeServiceManager {};
+                let service_manager = ServiceController {};
                 service_manager.create_service_user(service_user)?;
 
                 let service_log_dir_path =
@@ -634,7 +637,7 @@ async fn main() -> Result<()> {
                         println!("=================================================");
                     }
 
-                    start_faucet(&mut faucet, &NodeServiceManager {}, verbosity.clone()).await?;
+                    start_faucet(&mut faucet, &ServiceController {}, verbosity.clone()).await?;
                     node_registry.faucet = Some(faucet);
                     node_registry.save()?;
                     return Ok(());
@@ -656,7 +659,7 @@ async fn main() -> Result<()> {
                     }
 
                     let mut faucet = faucet;
-                    stop_faucet(&mut faucet, &NodeServiceManager {}).await?;
+                    stop_faucet(&mut faucet, &ServiceController {}).await?;
                     node_registry.faucet = Some(faucet);
                     node_registry.save()?;
                     return Ok(());
@@ -719,7 +722,7 @@ async fn main() -> Result<()> {
                 safenode_bin_path: node_path,
                 skip_validation: true,
             };
-            run_network(options, &mut local_node_registry, &NodeServiceManager {}).await?;
+            run_network(options, &mut local_node_registry, &ServiceController {}).await?;
             Ok(())
         }
         SubCmd::Kill { keep_directories } => kill_local_network(verbosity, keep_directories),
@@ -746,7 +749,7 @@ async fn main() -> Result<()> {
                     .iter_mut()
                     .find(|x| x.service_name == *name)
                     .ok_or_else(|| eyre!("No service named '{name}'"))?;
-                remove(node, &NodeServiceManager {}, keep_directories).await?;
+                remove(node, &ServiceController {}, keep_directories).await?;
             } else if let Some(ref peer_id) = peer_id {
                 let peer_id = PeerId::from_str(peer_id)?;
                 let node = node_registry
@@ -759,7 +762,7 @@ async fn main() -> Result<()> {
                             peer_id.to_string()
                         ))
                     })?;
-                remove(node, &NodeServiceManager {}, keep_directories).await?;
+                remove(node, &ServiceController {}, keep_directories).await?;
             }
 
             node_registry.save()?;
@@ -832,7 +835,7 @@ async fn main() -> Result<()> {
                 safenode_bin_path: node_path,
                 skip_validation: true,
             };
-            run_network(options, &mut local_node_registry, &NodeServiceManager {}).await?;
+            run_network(options, &mut local_node_registry, &ServiceController {}).await?;
 
             local_node_registry.save()?;
 
@@ -861,7 +864,14 @@ async fn main() -> Result<()> {
                     .ok_or_else(|| eyre!("No service named '{name}'"))?;
 
                 let rpc_client = RpcClient::from_socket_addr(node.rpc_socket_addr);
-                start(node, &NodeServiceManager {}, &rpc_client, verbosity).await?;
+                let service = NodeService::new(node.clone(), Box::new(rpc_client));
+                let mut service_manager = ServiceManager::new(
+                    service,
+                    Box::new(ServiceController {}),
+                    VerbosityLevel::Normal,
+                );
+                service_manager.start().await?;
+
                 node_registry.save()?;
             } else if let Some(ref peer_id) = peer_id {
                 let peer_id = PeerId::from_str(peer_id)?;
@@ -877,7 +887,14 @@ async fn main() -> Result<()> {
                     })?;
 
                 let rpc_client = RpcClient::from_socket_addr(node.rpc_socket_addr);
-                start(node, &NodeServiceManager {}, &rpc_client, verbosity).await?;
+                let service = NodeService::new(node.clone(), Box::new(rpc_client));
+                let mut service_manager = ServiceManager::new(
+                    service,
+                    Box::new(ServiceController {}),
+                    VerbosityLevel::Normal,
+                );
+                service_manager.start().await?;
+
                 node_registry.save()?;
             } else {
                 let mut failed_services = Vec::new();
@@ -885,14 +902,14 @@ async fn main() -> Result<()> {
                 for i in 0..node_count {
                     let rpc_client =
                         RpcClient::from_socket_addr(node_registry.nodes[i].rpc_socket_addr);
-                    let result = start(
-                        &mut node_registry.nodes[i],
-                        &NodeServiceManager {},
-                        &rpc_client,
-                        verbosity.clone(),
-                    )
-                    .await;
-                    match result {
+                    let service =
+                        NodeService::new(node_registry.nodes[i].clone(), Box::new(rpc_client));
+                    let mut service_manager = ServiceManager::new(
+                        service,
+                        Box::new(ServiceController {}),
+                        VerbosityLevel::Normal,
+                    );
+                    match service_manager.start().await {
                         Ok(()) => {
                             node_registry.save()?;
                         }
@@ -930,7 +947,7 @@ async fn main() -> Result<()> {
                 }
                 status(
                     &mut local_node_registry,
-                    &NodeServiceManager {},
+                    &ServiceController {},
                     details,
                     json,
                     fail,
@@ -949,7 +966,7 @@ async fn main() -> Result<()> {
                 }
                 status(
                     &mut node_registry,
-                    &NodeServiceManager {},
+                    &ServiceController {},
                     details,
                     json,
                     fail,
@@ -979,7 +996,7 @@ async fn main() -> Result<()> {
                     .iter_mut()
                     .find(|x| x.service_name == *name)
                     .ok_or_else(|| eyre!("No service named '{name}'"))?;
-                stop(node, &NodeServiceManager {}).await?;
+                stop(node, &ServiceController {}).await?;
             } else if let Some(ref peer_id) = peer_id {
                 let peer_id = PeerId::from_str(peer_id)?;
                 let node = node_registry
@@ -992,10 +1009,10 @@ async fn main() -> Result<()> {
                             peer_id.to_string()
                         ))
                     })?;
-                stop(node, &NodeServiceManager {}).await?;
+                stop(node, &ServiceController {}).await?;
             } else {
                 for node in node_registry.nodes.iter_mut() {
-                    stop(node, &NodeServiceManager {}).await?;
+                    stop(node, &ServiceController {}).await?;
                 }
             }
 
@@ -1101,7 +1118,7 @@ async fn main() -> Result<()> {
                     target_version: target_version.clone(),
                 };
 
-                match upgrade(options, node, &NodeServiceManager {}, &rpc_client).await {
+                match upgrade(options, node, &ServiceController {}, &rpc_client).await {
                     Ok(upgrade_result) => {
                         upgrade_summary.push((node.service_name.clone(), upgrade_result));
                     }
@@ -1141,7 +1158,7 @@ async fn main() -> Result<()> {
                     target_version: target_version.clone(),
                 };
 
-                match upgrade(options, node, &NodeServiceManager {}, &rpc_client).await {
+                match upgrade(options, node, &ServiceController {}, &rpc_client).await {
                     Ok(upgrade_result) => {
                         upgrade_summary.push((node.service_name.clone(), upgrade_result));
                     }
@@ -1170,7 +1187,7 @@ async fn main() -> Result<()> {
                         target_version: target_version.clone(),
                     };
 
-                    match upgrade(options, node, &NodeServiceManager {}, &rpc_client).await {
+                    match upgrade(options, node, &ServiceController {}, &rpc_client).await {
                         Ok(upgrade_result) => {
                             upgrade_summary.push((node.service_name.clone(), upgrade_result));
                         }

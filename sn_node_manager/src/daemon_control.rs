@@ -6,7 +6,7 @@
 // KIND, either express or implied. Please review the Licences for the specific language governing
 // permissions and limitations relating to use of the SAFE Network Software.
 
-use crate::{config::create_owned_dir, node_control, service::ServiceControl, VerbosityLevel};
+use crate::{config::create_owned_dir, node_control, VerbosityLevel};
 use color_eyre::{
     eyre::{eyre, OptionExt},
     Result,
@@ -14,8 +14,9 @@ use color_eyre::{
 use colored::Colorize;
 use libp2p::PeerId;
 use service_manager::{ServiceInstallCtx, ServiceLabel};
-use sn_node_rpc_client::RpcActions;
-use sn_service_management::{Daemon, Node, NodeRegistry, NodeStatus};
+use sn_service_management::{
+    control::ServiceControl, rpc::RpcActions, Daemon, NodeRegistry, NodeServiceData, ServiceStatus,
+};
 use std::{
     ffi::OsString,
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -67,7 +68,7 @@ pub fn add_daemon(
                 endpoint: Some(SocketAddr::new(IpAddr::V4(address), port)),
                 pid: None,
                 service_name: DAEMON_SERVICE_NAME.to_string(),
-                status: NodeStatus::Added,
+                status: ServiceStatus::Added,
             };
             node_registry.daemon = Some(daemon);
 
@@ -78,7 +79,7 @@ pub fn add_daemon(
         }
         Err(e) => {
             println!("Failed to add daemon service: {e}");
-            Err(e)
+            Err(e.into())
         }
     }
 }
@@ -88,7 +89,7 @@ pub fn start_daemon(
     service_control: &dyn ServiceControl,
     verbosity: VerbosityLevel,
 ) -> Result<()> {
-    if let NodeStatus::Running = daemon.status {
+    if let ServiceStatus::Running = daemon.status {
         if service_control.is_service_process_running(daemon.pid.unwrap()) {
             println!("The {} service is already running", daemon.service_name);
             return Ok(());
@@ -102,7 +103,7 @@ pub fn start_daemon(
 
     let pid = service_control.get_process_pid(&daemon.service_name)?;
     daemon.pid = Some(pid);
-    daemon.status = NodeStatus::Running;
+    daemon.status = ServiceStatus::Running;
 
     println!("{} Started faucet service", "✓".green());
     if verbosity != VerbosityLevel::Minimal {
@@ -115,15 +116,15 @@ pub fn start_daemon(
 
 pub fn stop_daemon(daemon: &mut Daemon, service_control: &dyn ServiceControl) -> Result<()> {
     match daemon.status {
-        NodeStatus::Added => {
+        ServiceStatus::Added => {
             println!("The daemon has not been started since it was installed");
             Ok(())
         }
-        NodeStatus::Removed => {
+        ServiceStatus::Removed => {
             println!("The daemon service was removed");
             Ok(())
         }
-        NodeStatus::Running => {
+        ServiceStatus::Running => {
             let pid = daemon.pid.ok_or_eyre("The PID was not set")?;
             if service_control.is_service_process_running(pid) {
                 println!("Attempting to stop {}...", daemon.service_name);
@@ -142,10 +143,10 @@ pub fn stop_daemon(daemon: &mut Daemon, service_control: &dyn ServiceControl) ->
                 );
             }
             daemon.pid = None;
-            daemon.status = NodeStatus::Stopped;
+            daemon.status = ServiceStatus::Stopped;
             Ok(())
         }
-        NodeStatus::Stopped => {
+        ServiceStatus::Stopped => {
             println!("{} The faucet was already stopped", "✓".green(),);
             Ok(())
         }
@@ -296,7 +297,7 @@ pub async fn restart_node_service(
             eyre!("Error while installing node {new_service_name:?} with: {err:?}",)
         })?;
 
-        let mut node = Node {
+        let mut node = NodeServiceData {
             genesis: current_node.genesis,
             local: current_node.local,
             service_name: new_service_name.clone(),
@@ -304,7 +305,7 @@ pub async fn restart_node_service(
             number: new_node_number as u16,
             rpc_socket_addr: current_node.rpc_socket_addr,
             version: current_node.version.clone(),
-            status: NodeStatus::Added,
+            status: ServiceStatus::Added,
             listen_addr: None,
             pid: None,
             peer_id: None,

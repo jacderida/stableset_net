@@ -6,90 +6,48 @@
 // KIND, either express or implied. Please review the Licences for the specific language governing
 // permissions and limitations relating to use of the SAFE Network Software.
 
+pub mod control;
 pub mod error;
+pub mod node;
+pub mod rpc;
 
 pub mod safenode_manager_proto {
     tonic::include_proto!("safenode_manager_proto");
 }
 
 use crate::error::{Error, Result};
-use libp2p::{Multiaddr, PeerId};
-use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize, Serializer};
-use sn_protocol::get_port_from_multiaddr;
+use async_trait::async_trait;
+use libp2p::Multiaddr;
+use serde::{Deserialize, Serialize};
 use std::{
     io::{Read, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
-    str::FromStr,
 };
 
+pub use node::{NodeService, NodeServiceData};
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub enum NodeStatus {
-    /// The node service has been added but not started for the first time
+pub enum ServiceStatus {
+    /// The service has been added but not started for the first time
     Added,
     /// Last time we checked the service was running
     Running,
-    /// The node service has been stopped
+    /// The service has been stopped
     Stopped,
-    /// The node service has been removed
+    /// The service has been removed
     Removed,
 }
 
-fn serialize_peer_id<S>(value: &Option<PeerId>, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    if let Some(peer_id) = value {
-        return serializer.serialize_str(&peer_id.to_string());
-    }
-    serializer.serialize_none()
-}
-
-fn deserialize_peer_id<'de, D>(deserializer: D) -> Result<Option<PeerId>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let s: Option<String> = Option::deserialize(deserializer)?;
-    if let Some(peer_id_str) = s {
-        PeerId::from_str(&peer_id_str)
-            .map(Some)
-            .map_err(DeError::custom)
-    } else {
-        Ok(None)
-    }
-}
-
-fn serialize_connected_peers<S>(
-    connected_peers: &Option<Vec<PeerId>>,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    match connected_peers {
-        Some(peers) => {
-            let peer_strs: Vec<String> = peers.iter().map(|p| p.to_string()).collect();
-            serializer.serialize_some(&peer_strs)
-        }
-        None => serializer.serialize_none(),
-    }
-}
-
-fn deserialize_connected_peers<'de, D>(deserializer: D) -> Result<Option<Vec<PeerId>>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let vec: Option<Vec<String>> = Option::deserialize(deserializer)?;
-    match vec {
-        Some(peer_strs) => {
-            let peers: Result<Vec<PeerId>, _> = peer_strs
-                .into_iter()
-                .map(|s| PeerId::from_str(&s).map_err(DeError::custom))
-                .collect();
-            peers.map(Some)
-        }
-        None => Ok(None),
-    }
+#[async_trait]
+pub trait ServiceStateActions {
+    fn bin_path(&self) -> PathBuf;
+    fn data_dir_path(&self) -> PathBuf;
+    fn log_dir_path(&self) -> PathBuf;
+    fn name(&self) -> String;
+    fn pid(&self) -> Option<u32>;
+    async fn initialize(&mut self) -> Result<()>;
+    fn status(&self) -> ServiceStatus;
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -99,51 +57,9 @@ pub struct Faucet {
     pub log_dir_path: PathBuf,
     pub pid: Option<u32>,
     pub service_name: String,
-    pub status: NodeStatus,
+    pub status: ServiceStatus,
     pub user: String,
     pub version: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Node {
-    pub genesis: bool,
-    pub local: bool,
-    pub version: String,
-    pub service_name: String,
-    pub user: String,
-    pub number: u16,
-    pub rpc_socket_addr: SocketAddr,
-    pub status: NodeStatus,
-    pub pid: Option<u32>,
-    #[serde(
-        serialize_with = "serialize_peer_id",
-        deserialize_with = "deserialize_peer_id"
-    )]
-    pub peer_id: Option<PeerId>,
-    pub listen_addr: Option<Vec<Multiaddr>>,
-    pub data_dir_path: PathBuf,
-    pub log_dir_path: PathBuf,
-    pub safenode_path: PathBuf,
-    #[serde(
-        serialize_with = "serialize_connected_peers",
-        deserialize_with = "deserialize_connected_peers"
-    )]
-    pub connected_peers: Option<Vec<PeerId>>,
-}
-
-impl Node {
-    /// Returns the UDP port from our node's listen address.
-    pub fn get_safenode_port(&self) -> Option<u16> {
-        // assuming the listening addr contains /ip4/127.0.0.1/udp/56215/quic-v1/p2p/<peer_id>
-        if let Some(multi_addrs) = &self.listen_addr {
-            for addr in multi_addrs {
-                if let Some(port) = get_port_from_multiaddr(addr) {
-                    return Some(port);
-                }
-            }
-        }
-        None
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -152,7 +68,7 @@ pub struct Daemon {
     pub endpoint: Option<SocketAddr>,
     pub pid: Option<u32>,
     pub service_name: String,
-    pub status: NodeStatus,
+    pub status: ServiceStatus,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -161,7 +77,7 @@ pub struct NodeRegistry {
     pub daemon: Option<Daemon>,
     pub environment_variables: Option<Vec<(String, String)>>,
     pub faucet: Option<Faucet>,
-    pub nodes: Vec<Node>,
+    pub nodes: Vec<NodeServiceData>,
     pub save_path: PathBuf,
 }
 

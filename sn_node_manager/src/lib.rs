@@ -11,8 +11,8 @@ pub mod daemon_control;
 pub mod faucet_control;
 pub mod helpers;
 pub mod local;
+pub mod manager;
 pub mod node_control;
-pub mod service;
 
 #[derive(Clone, PartialEq)]
 pub enum VerbosityLevel {
