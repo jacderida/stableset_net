@@ -18,7 +18,8 @@ use sn_node_manager::{
     helpers::download_and_extract_release,
     local::{kill_network, run_network, LocalNetworkOptions},
     node_control::{
-        add, remove, start, status, stop, upgrade, AddServiceOptions, UpgradeOptions, UpgradeResult,
+        add, remove, start, status, stop, upgrade,
+        AddServiceOptions, UpgradeOptions, UpgradeResult,
     },
     service::{NodeServiceManager, ServiceControl},
     VerbosityLevel,
