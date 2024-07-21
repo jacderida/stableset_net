@@ -16,8 +16,7 @@ fi
 declare -A crates_bumped
 crates_bumped_with_version=()
 
-# Remove the --allow-dirty flag
-release-plz update --allow-dirty 2>&1 | tee bump_version_output
+release-plz update 2>&1 | tee bump_version_output
 
 while IFS= read -r line; do
   # Sometimes this list can include crates that were not bumped. The presence of "->" indicates
