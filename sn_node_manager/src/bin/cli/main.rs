@@ -22,22 +22,35 @@ use tracing::Level;
 const DEFAULT_NODE_COUNT: u16 = 25;
 
 #[derive(Parser)]
-#[command(author, version, about, long_about = None)]
+#[command(disable_version_flag = true)]
 pub(crate) struct Cmd {
     /// Available sub commands.
     #[clap(subcommand)]
     pub cmd: SubCmd,
 
-    #[clap(short, long, action = clap::ArgAction::Count, default_value_t = 2)]
-    verbose: u8,
+    /// Print the crate version.
+    #[clap(long)]
+    pub crate_version: bool,
 
     /// Output debug-level logging to stderr.
     #[clap(long, conflicts_with = "trace")]
     debug: bool,
 
+    /// Print the package version.
+    #[cfg(not(feature = "nightly"))]
+    #[clap(long)]
+    pub package_version: bool,
+
     /// Output trace-level logging to stderr.
     #[clap(long, conflicts_with = "debug")]
     trace: bool,
+
+    #[clap(short, long, action = clap::ArgAction::Count, default_value_t = 2)]
+    verbose: u8,
+
+    /// Print version information.
+    #[clap(long)]
+    version: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -997,6 +1010,30 @@ pub enum LocalSubCmd {
 async fn main() -> Result<()> {
     color_eyre::install()?;
     let args = Cmd::parse();
+
+    if args.version {
+        println!(
+            "{}",
+            sn_build_info::version_string(
+                "Autonomi Node Manager",
+                env!("CARGO_PKG_VERSION"),
+                None
+            )
+        );
+        return Ok(());
+    }
+
+    if args.crate_version {
+        println!("{}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
+    #[cfg(not(feature = "nightly"))]
+    if args.package_version {
+        println!("{}", sn_build_info::package_version());
+        return Ok(());
+    }
+
     let verbosity = VerbosityLevel::from(args.verbose);
 
     let _log_handle = if args.debug || args.trace {
