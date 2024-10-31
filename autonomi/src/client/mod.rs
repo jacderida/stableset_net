@@ -43,7 +43,7 @@ use std::{collections::HashSet, sync::Arc, time::Duration};
 use tokio::sync::mpsc;
 
 /// Time before considering the connection timed out.
-pub const CONNECT_TIMEOUT_SECS: u64 = 10;
+pub const CONNECT_TIMEOUT_SECS: u64 = 20;
 
 const CLIENT_EVENT_CHANNEL_SIZE: usize = 100;
 
